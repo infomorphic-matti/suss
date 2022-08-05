@@ -1,7 +1,7 @@
 //! Like [`crate::socket_shims`], but allows the creation of a timeout instead, falling back to an `unblock`
 //! in the worst case.
 
-use std::{time::Duration, future::Future};
+use std::{future::Future, time::Duration};
 
 #[cfg(feature = "async-std")]
 pub async fn async_std_sleep(time: Duration) {
@@ -24,7 +24,7 @@ pub async fn sleep(time: Duration) {
 
 #[cfg(all(feature = "tokio", not(feature = "async-std")))]
 /// Sleep for the alloted period of time. Uses async runtime environments where possible.
-pub async fn sleep(time: Duration) { 
+pub async fn sleep(time: Duration) {
     tokio_sleep(time).await
 }
 
@@ -39,13 +39,16 @@ pub async fn sleep(time: Duration) {
 /// output of the future in place.
 ///
 /// If the future is ready at the same time the timeout expires, [Some] is returned.
-pub async fn with_timeout<T>(inner_future: impl Future<Output = T>, timeout: Duration) -> Option<T> {
+pub async fn with_timeout<T>(
+    inner_future: impl Future<Output = T>,
+    timeout: Duration,
+) -> Option<T> {
     use crate::future::FutureExt;
     use crate::mapfut::map_fut;
-    map_fut(inner_future, Some).or(map_fut(sleep(timeout), |_| None)).await
+    map_fut(inner_future, Some)
+        .or(map_fut(sleep(timeout), |_| None))
+        .await
 }
-
-
 
 // suss - library for creating single, directory namespaced unix socket servers in a network
 // Copyright (C) 2022  Matti Bryce <mattibryce@protonmail.com>

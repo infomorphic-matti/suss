@@ -34,7 +34,7 @@ pub trait UnixSocketImplementation {
     /// Listen for a single new connection. Socket address is not used, because different APIs
     /// have different types and its annoying (well, tokio has mio and the rest use std's)
     async fn ul_try_accept_connection(v: &Self::UnixListener) -> IoResult<Self::UnixStream>;
-    
+
     /// Convert a [`std::os::unix::net::UnixListener`] into the native unix stream type
     fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener>;
     /// Inverse of [`Self::ul_from_std`]
@@ -58,9 +58,13 @@ impl UnixSocketImplementation for TokioUnixSocks {
     async fn us_shutdown(v: &mut Self::UnixStream) -> IoResult<()> {
         <Self::UnixStream as tokio::io::AsyncWriteExt>::shutdown(v).await
     }
-    
-    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> { Self::UnixStream::from_std(stdunix) }
-    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> { nativeunix.into_std() }
+
+    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> {
+        Self::UnixStream::from_std(stdunix)
+    }
+    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> {
+        nativeunix.into_std()
+    }
 
     async fn ul_bind(path: &Path) -> IoResult<Self::UnixListener> {
         Self::UnixListener::bind(path)
@@ -69,9 +73,13 @@ impl UnixSocketImplementation for TokioUnixSocks {
     async fn ul_try_accept_connection(v: &Self::UnixListener) -> IoResult<Self::UnixStream> {
         v.accept().await.map(|(stream, _)| stream)
     }
-    
-    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> { Self::UnixListener::from_std(stdunix) }
-    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> { nativeunix.into_std() }
+
+    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> {
+        Self::UnixListener::from_std(stdunix)
+    }
+    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> {
+        nativeunix.into_std()
+    }
 }
 
 #[cfg(feature = "async-std")]
@@ -91,9 +99,13 @@ impl UnixSocketImplementation for AsyncStdUnixSocks {
     async fn us_shutdown(v: &mut Self::UnixStream) -> IoResult<()> {
         v.shutdown(Shutdown::Both)
     }
-    
-    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> { Ok(Self::UnixStream::from(stdunix)) }
-    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> { nativeunix.try_into() }
+
+    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> {
+        Ok(Self::UnixStream::from(stdunix))
+    }
+    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> {
+        nativeunix.try_into()
+    }
 
     async fn ul_bind(path: &Path) -> IoResult<Self::UnixListener> {
         Self::UnixListener::bind(path).await
@@ -102,9 +114,13 @@ impl UnixSocketImplementation for AsyncStdUnixSocks {
     async fn ul_try_accept_connection(v: &Self::UnixListener) -> IoResult<Self::UnixStream> {
         v.accept().await.map(|(stream, _)| stream)
     }
-    
-    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> { Ok(Self::UnixListener::from(stdunix)) }
-    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> { nativeunix.try_into() }
+
+    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> {
+        Ok(Self::UnixListener::from(stdunix))
+    }
+    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> {
+        nativeunix.try_into()
+    }
 }
 
 /// Falls back to using the synchronous std unix sockets on a threadpool (provided by [`unblock`])
@@ -129,8 +145,12 @@ impl UnixSocketImplementation for FallbackSyncUnixSocks {
         v.shutdown(Shutdown::Both)
     }
 
-    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> { Ok(stdunix) }
-    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> { Ok(nativeunix) }
+    fn us_from_std(stdunix: std::os::unix::net::UnixStream) -> IoResult<Self::UnixStream> {
+        Ok(stdunix)
+    }
+    fn us_to_std(nativeunix: Self::UnixStream) -> IoResult<std::os::unix::net::UnixStream> {
+        Ok(nativeunix)
+    }
 
     async fn ul_bind(path: &Path) -> IoResult<Self::UnixListener> {
         // [unblock] requires a 'static function to be passed to it, and unfortunately at the
@@ -140,16 +160,22 @@ impl UnixSocketImplementation for FallbackSyncUnixSocks {
         unblock(move || Self::UnixListener::bind(op)).await
     }
 
-    async fn ul_try_accept_connection(v: &Self::UnixListener) -> IoResult<Self::UnixStream> { 
+    async fn ul_try_accept_connection(v: &Self::UnixListener) -> IoResult<Self::UnixStream> {
         // [unblock] requires a 'static function to be passed to it, and unfortunately at the
         // minute there is not a runtime-agnostic scoped async threadpool so we can't fix the
         // 'static requirement. Therefore we simply try and duplicate the unix listener handle.
         let duplicated_listener_handle = v.try_clone()?;
-        unblock(move || duplicated_listener_handle.accept()).await.map(|(stream, _)| stream)
+        unblock(move || duplicated_listener_handle.accept())
+            .await
+            .map(|(stream, _)| stream)
     }
-    
-    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> { Ok(stdunix) }
-    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> { Ok(nativeunix) }
+
+    fn ul_from_std(stdunix: std::os::unix::net::UnixListener) -> IoResult<Self::UnixListener> {
+        Ok(stdunix)
+    }
+    fn ul_to_std(nativeunix: Self::UnixListener) -> IoResult<std::os::unix::net::UnixListener> {
+        Ok(nativeunix)
+    }
 }
 
 // The part where we select the "default" unix socks barebones common interface.
@@ -163,8 +189,6 @@ pub type DefaultUnixSocks = AsyncStdUnixSocks;
 pub type DefaultUnixSocks = TokioUnixSocks;
 #[cfg(not(any(feature = "tokio", feature = "async-std")))]
 pub type DefaultUnixSocks = FallbackSyncUnixSocks;
-
-
 
 // suss - library for creating single, directory namespaced unix socket servers in a network
 // Copyright (C) 2022  Matti Bryce <mattibryce@protonmail.com>

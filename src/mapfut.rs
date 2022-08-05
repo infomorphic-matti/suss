@@ -2,12 +2,10 @@
 
 use std::future::Future;
 
-/// Takes a future and a map, and maps the result of that future with a function. 
+/// Takes a future and a map, and maps the result of that future with a function.
 pub async fn map_fut<T, Q>(f: impl Future<Output = T>, t: impl FnOnce(T) -> Q) -> Q {
     t(f.await)
 }
-
-
 
 // suss - library for creating single, directory namespaced unix socket servers in a network
 // Copyright (C) 2022  Matti Bryce <mattibryce@protonmail.com>

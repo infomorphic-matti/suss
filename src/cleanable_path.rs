@@ -1,7 +1,9 @@
 //! Path that gets removed from the file system when dropped.
 
-use std::{path::{PathBuf, Path}, borrow::Borrow};
-
+use std::{
+    borrow::Borrow,
+    path::{Path, PathBuf},
+};
 
 /// Path that has [`std::fs::remove_file`] called on drop - used to clean up sockets.
 ///
@@ -42,7 +44,6 @@ impl Drop for CleanablePathBuf {
         std::fs::remove_file(&self.0);
     }
 }
-
 
 // suss - library for creating single, directory namespaced unix socket servers in a network
 // Copyright (C) 2022  Matti Bryce <mattibryce@protonmail.com>

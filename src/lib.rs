@@ -61,7 +61,7 @@ pub trait Service: Debug {
     fn run_service_command_raw(&self, liveness_path: Option<&Path>) -> IoResult<Child>;
 
     /// This function is applied to the child process after it has passed the liveness check but
-    /// before it has been connected to. In here you can add it to a threadpool or something if you want to 
+    /// before it has been connected to. In here you can add it to a threadpool or something if you want to
     /// .wait on it. Bear in mind it is an async function so don't block.
     ///
     /// The default version of this function will simply drop the child and leave it a zombie -
@@ -180,8 +180,13 @@ pub trait ServiceExt: Service {
                             humantime::format_duration(liveness_timeout)
                         ),
                     ))
-                }).map_err(|e| {
-                    error!("Failed to receive liveness ping for service on ephemeral socket {} - {}", ephemeral_socket_path.as_ref().display(),  e);
+                })
+                .map_err(|e| {
+                    error!(
+                        "Failed to receive liveness ping for service on ephemeral socket {} - {}",
+                        ephemeral_socket_path.as_ref().display(),
+                        e
+                    );
                     e
                 })?;
 
@@ -192,7 +197,8 @@ pub trait ServiceExt: Service {
 
                 self.after_post_liveness_subprocess(child_proc).await?;
                 info!("Successfully received ephemeral liveness ping - trying to connect to service again.");
-                self.connect_to_running_service(base_context_directory).await
+                self.connect_to_running_service(base_context_directory)
+                    .await
             }
         }
     }
@@ -212,7 +218,7 @@ pub struct ServerService<ServiceSpec: Service, SocketWrapper = UnixListener> {
     socket_path: CleanablePathBuf,
 }
 
-impl <ServiceSpec: Service, SocketWrapper> Debug for ServerService<ServiceSpec, SocketWrapper> {
+impl<ServiceSpec: Service, SocketWrapper> Debug for ServerService<ServiceSpec, SocketWrapper> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerService")
             .field("service", &self.service)
@@ -308,7 +314,7 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
 
 /// Module for usually-necessary imports.
 pub mod prelude {
-    pub use super::{Service, ServiceExt, ServerService};
+    pub use super::{ServerService, Service, ServiceExt};
 }
 
 #[cfg(test)]
