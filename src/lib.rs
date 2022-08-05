@@ -4,6 +4,9 @@
 //!
 //! In the case that a service already exists, then this will communicate with the appropriate
 //! socket, rather than start a new one.
+//!
+//! At the minute, to get started, you will need to define the [`Service`] trait to define client
+//! an access point, along with a means of starting that service if it doesn't yet exist
 
 mod cleanable_path;
 pub mod mapfut;
@@ -37,7 +40,7 @@ use tracing::{error, info, instrument, trace, warn};
 /// `UnixStream` and if it fails, try to start the service.
 ///
 /// Socket files, actually running the service, etc. are not handled by this trait. Instead, they
-/// are handled by a [ServerService], which takes care of things like cleaning up socket files
+/// are handled by a [`ServerService`], which takes care of things like cleaning up socket files
 /// afterward automatically in [`Drop`]
 #[async_trait]
 pub trait Service: Debug {
@@ -55,7 +58,9 @@ pub trait Service: Debug {
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service (probably by way of a command line
-    /// argument).
+    /// argument). The ephemeral socket path should be connected to and then immediately shut down
+    /// by the running service process (this is handled automatically by [`ServerService`] if you 
+    /// use that to run your service).
     ///
     /// Ephemeral liveness check timeouts are applied by the library later on.
     fn run_service_command_raw(&self, liveness_path: Option<&Path>) -> IoResult<Child>;
@@ -269,7 +274,8 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
     ///  
     ///  * `die_with_parent_prefailure` tells the server function to error out if a liveness path is
     ///  provided and yet the unix socket can't be connected to - probably something to do with the
-    ///  parent process being dead. This ties the lifetime of this service to the lifetime of the  
+    ///  parent process being dead. This ensures that there is an overlap in the lifetime of the
+    ///  parent process and the lifetime of this service. 
     ///
     /// Uses [`socket_shims::DefaultUnixSocks`] for creating and managing any temporary sockets
     /// asynchronously.
