@@ -71,7 +71,7 @@ pub trait Service: Debug {
     /// block your own process until the child dies but hey ho!, sort that out yourself :) - you
     /// probably want to use your runtime's equivalent of `spawn` for this.
     ///
-    /// Of course this function, like the [`run_service_command_raw`] function, are not used at all
+    /// Of course this function, like the [`Self::run_service_command_raw`] function, are not used at all
     /// if the service already exists in base context directory.
     async fn after_post_liveness_subprocess(&self, _: Child) -> IoResult<()> {
         Ok(())
@@ -94,7 +94,7 @@ fn get_random_sockpath() -> std::path::PathBuf {
 #[async_trait]
 pub trait ServiceExt: Service {
     /// Attempt to connect to an already running service. This will not try to start the service on
-    /// failure - for that, see [`connect_to_service`]
+    /// failure - for that, see [`Self::connect_to_service`]
     #[instrument]
     async fn connect_to_running_service(
         &self,

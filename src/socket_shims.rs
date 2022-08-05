@@ -1,8 +1,6 @@
 //! Module that contains implementations of a unified asynchronous unix socket API, falling back on
 //! synchronous [`std::os::unix::net`] functions and types when using an unfamiliar async runtime
 //! (or no async runtime at all!).
-//!
-//! Uses [`async_trait`] until
 
 use std::{net::Shutdown, path::Path};
 
