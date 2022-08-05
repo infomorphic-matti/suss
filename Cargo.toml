@@ -27,3 +27,7 @@ humantime = "2"
 # Note that we have these as optional dependencies to implement asynchronous unix stream interfaces
 tokio = { version = "1", optional = true, default-features = false, features = ["net", "io-util", "time"]}
 async-std = { version = "1", optional = true }
+
+
+[package.metadata.docs.rs]
+all-features = true
