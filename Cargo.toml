@@ -1,0 +1,23 @@
+[package]
+name = "suss"
+version = "0.2.0"
+edition = "2021"
+authors = ["Matti Bryce <mattibryce@protonmail.com>"]
+license = "AGPLv3+"
+description = "Create networks of singleton unix socket services focused around an actor model"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1"
+# Used in our std async unix socket shims
+blocking = "1"
+log = "0.4" 
+futures-lite = "1"
+tracing = { version = "0.1", features = ["log"] }
+nanorand = { version = "0.7", default-features = false, features = ["std", "getrandom", "chacha", "zeroize"]}
+humantime = "2"
+
+# Note that we have these as optional dependencies to implement asynchronous unix stream interfaces
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "io-util", "time"]}
+async-std = { version = "1", optional = true }
