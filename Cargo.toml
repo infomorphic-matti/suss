@@ -8,8 +8,8 @@ description = "Create collections of single-instance unix socket services, start
 keywords = ["async", "io", "non-blocking", "daemon", "unix"]
 categories = ["network-programming"]
 readme = "README.md"
-repository = "https://github.com/informorphic-matti/suss"
-homepage = "https://github.com/informorphic-matti/suss"
+repository = "https://github.com/infomorphic-matti/suss"
+homepage = "https://github.com/infomorphic-matti/suss"
 documentation = "https://docs.rs/suss"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
