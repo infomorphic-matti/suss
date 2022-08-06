@@ -19,7 +19,7 @@ use cleanable_path::CleanablePathBuf;
 pub use futures_lite::future;
 
 use socket_shims::{DefaultUnixSocks, UnixSocketImplementation};
-use std::{fmt::Debug, future::Future, os::unix::net::UnixListener, path::Path, ffi::OsStr};
+use std::{ffi::OsStr, fmt::Debug, future::Future, os::unix::net::UnixListener, path::Path};
 use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, time::Duration};
 use timefut::with_timeout;
 use tracing::{error, info, instrument, trace, warn};
@@ -70,17 +70,21 @@ pub trait Service: Debug {
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service (probably by way of a command line
-    /// argument). 
+    /// argument).
     ///
     /// The provided executor argument list should be prefixed to any commandline executions if possible -
     /// it provides a convenient means of allowing replaceable and instrumentable services.
     ///
     /// The ephemeral socket path should be connected to and then immediately shut down
-    /// by the running service process (this is handled automatically by [`ServerService`] if you 
+    /// by the running service process (this is handled automatically by [`ServerService`] if you
     /// use that to run your service).
     ///
     /// Ephemeral liveness check timeouts are applied by the library later on.
-    fn run_service_command_raw(&self, executor_commandline_prefix: Option<&[&OsStr]> , liveness_path: Option<&Path>) -> IoResult<Child>;
+    fn run_service_command_raw(
+        &self,
+        executor_commandline_prefix: Option<&[&OsStr]>,
+        liveness_path: Option<&Path>,
+    ) -> IoResult<Child>;
 
     /// This function is applied to the child process after it has passed the liveness check but
     /// before it has been connected to. In here you can add it to a threadpool or something if you want to
@@ -188,7 +192,10 @@ pub trait ServiceExt: Service {
 
                 // We have an ephemeral socket, so begin running the child process, using `unblock`
                 let child_proc = self
-                    .run_service_command_raw(executor_commandline_prefix, Some(ephemeral_socket_path.as_ref()))
+                    .run_service_command_raw(
+                        executor_commandline_prefix,
+                        Some(ephemeral_socket_path.as_ref()),
+                    )
                     .map_err(|e| {
                         error!("Could not start child service process - {}", e);
                         e
@@ -309,7 +316,7 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
     ///  * `die_with_parent_prefailure` tells the server function to error out if a liveness path is
     ///  provided and yet the unix socket can't be connected to - probably something to do with the
     ///  parent process being dead. This ensures that there is an overlap in the lifetime of the
-    ///  parent process and the lifetime of this service. 
+    ///  parent process and the lifetime of this service.
     ///
     /// Uses [`socket_shims::DefaultUnixSocks`] for creating and managing any temporary sockets
     /// asynchronously.
