@@ -18,9 +18,8 @@ documentation = "https://docs.rs/suss"
 async-trait = "0.1"
 # Used in our std async unix socket shims
 blocking = "1"
-log = "0.4" 
 futures-lite = "1"
-tracing = { version = "0.1", features = ["log"] }
+tracing = { version = "0.1" }
 nanorand = { version = "0.7", default-features = false, features = ["std", "getrandom", "chacha", "zeroize"]}
 humantime = "2"
 

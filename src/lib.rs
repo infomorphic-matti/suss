@@ -5,8 +5,7 @@
 //! In the case that a service already exists, then this will communicate with the appropriate
 //! socket, rather than start a new one.
 //!
-//! At the minute, to get started, you will need to define the [`Service`] trait to define client
-//! an access point, along with a means of starting that service if it doesn't yet exist
+//! To get started, take a look at the [`declare_service`] macro.
 
 mod cleanable_path;
 pub mod mapfut;
@@ -24,7 +23,12 @@ use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, tim
 use timefut::with_timeout;
 use tracing::{error, info, instrument, trace, warn};
 
-/// Trait used to define a single, startable service, with a relative socket path.
+/// Trait used to define a single, startable service, with a relative socket path. For a more
+/// concise way of implementing services, take a look at the [`declare_service`] and
+/// [`declare_service_bundle`] macros that let you implement this trait far more concisely. For the
+/// items emitted by service bundles, have a look at [`ReifiedService`], which embeds an executor
+/// prefix and base context directory along with an abstract service implementation encoded by this
+/// trait.
 ///
 /// A service - in `suss` terminology - is a process that can be communicated with
 /// through a [`std::os::unix::net::UnixStream`].
@@ -38,16 +42,16 @@ use tracing::{error, info, instrument, trace, warn};
 /// case of command execution to start a service, should be added to the start of all service
 /// commands as the actual executable to run. This is useful for some cases:
 /// * It may be useful to run anything with a prefix of /usr/bin/env in certain operating
-/// environments like nixos
+///   environments like nixos
 /// * It can be used to override implementations with a custom version of certain services
 /// * It can be used to instrument services with some kind of notification or liveness system
-/// outside of the one internally managed by this process
+///   outside of the one internally managed by this process
 /// * Anything else you can think of, as long as it ends up delegating to something that actually
-/// runs a valid service, or maybe fails if you want to conditionally prevent services from
-/// functioning.
+///   runs a valid service, or maybe fails if you want to conditionally prevent services from
+///   functioning.
 ///
 /// Each service has an associated *socket name*, which is a place in the *context base path*
-/// that all services put their receiver unix sockets. Services are checked for running-status by
+/// that services put their receiver unix sockets. Services are checked for running-status by
 /// if their associated socket files exist (and can be connected to) - i.e. they try to create a
 /// `UnixStream` and if it fails, try to start the service.
 ///
@@ -55,7 +59,7 @@ use tracing::{error, info, instrument, trace, warn};
 /// are handled by a [`ServerService`], which takes care of things like cleaning up socket files
 /// afterward automatically in [`Drop`]
 #[async_trait]
-pub trait Service: Debug {
+pub trait Service: Debug + Sync {
     /// A connection to the service server - must be generatable from a bare
     /// [`std::os::unix::net::UnixStream`]
     type ServiceClientConnection: Send;
@@ -119,6 +123,28 @@ fn get_random_sockpath() -> std::path::PathBuf {
 
 #[async_trait]
 pub trait ServiceExt: Service {
+    /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
+    /// connecting to it.
+    fn reify(self, base_context_directory: &Path) -> ReifiedService<'_, Self>
+    where
+        Self: Sized,
+    {
+        ReifiedService::reify_service(self, base_context_directory)
+    }
+
+    /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
+    /// connecting to it, including an executor prefix command.
+    fn reify_with_executor<'i>(
+        self,
+        base_context_directory: &'i Path,
+        executor_prefix: &'i [&'i OsStr],
+    ) -> ReifiedService<'i, Self>
+    where
+        Self: Sized,
+    {
+        ReifiedService::reify_service_with_executor(self, base_context_directory, executor_prefix)
+    }
+
     /// Attempt to connect to an already running service. This will not try to start the service on
     /// failure - for that, see [`Self::connect_to_service`]
     ///
@@ -264,11 +290,11 @@ impl<ServiceSpec: Service, SocketWrapper> Debug for ServerService<ServiceSpec, S
 
 impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapper> {
     /// This attempts to initially open the unix socket with the name appropriate to the service
-    /// (see [`Service`], in the current service namespace directory (the context base path). You
+    /// (see [`Service`]), in the current service namespace directory (the context base path). You
     /// must provide a means of converting a raw unix listener socket into a `SocketWrapper` that
     /// you can then use - this method can be fallible.
     ///
-    /// In implementations, [`Service::SocketWrapper`] is generally some kind of higher-level
+    /// In implementations, `SocketWrapper` is generally some kind of higher-level
     /// abstraction that provides things like RPC connection protocols or some kind of type
     /// encoding/decoding overlay for the raw connection.
     ///
@@ -359,14 +385,262 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
     }
 }
 
+#[derive(Debug)]
+/// Holds a particular instance of a [`Service`], along with a base context directory and optional
+/// executor prefix.
+///
+/// This lets you interact with services in a manner not requiring you to carry around
+/// base_context_directories and executor_prefixes, and they are what [`ServiceBundle`]s produce
+/// for you under the hood.
+pub struct ReifiedService<'info, S: Service> {
+    executor_prefix: Option<&'info [&'info OsStr]>,
+    base_context_directory: &'info Path,
+    bare_service: S,
+}
+
+impl<'info, S: Service + Sync> ReifiedService<'info, S> {
+    /// Reify a service into a specific base context directory
+    pub fn reify_service(service: S, base_context_directory: &'info Path) -> Self {
+        Self {
+            executor_prefix: None,
+            base_context_directory,
+            bare_service: service,
+        }
+    }
+
+    /// Reify a service along with an executor prefix.
+    pub fn reify_service_with_executor(
+        service: S,
+        base_context_directory: &'info Path,
+        executor_prefix: &'info [&'info OsStr],
+    ) -> Self {
+        Self {
+            executor_prefix: Some(executor_prefix),
+            base_context_directory,
+            bare_service: service,
+        }
+    }
+
+    /// Connect to this [`Service`], trying to start it if not possible.
+    ///
+    /// The timeout is for how long to wait until concluding that - in the case we attempted to
+    /// start a service because it wasn't running - the service failed to begin.
+    ///
+    /// If you don't care about starting the service on-demand, take a look at
+    /// [`Self::connect_to_running`]
+    #[instrument]
+    pub async fn connect(
+        &self,
+        liveness_timeout: Duration,
+    ) -> IoResult<S::ServiceClientConnection> {
+        self.bare_service
+            .connect_to_service(
+                self.executor_prefix,
+                self.base_context_directory,
+                liveness_timeout,
+            )
+            .await
+    }
+
+    /// Connect to this [`Service`], without attempts to start it upon failure.
+    ///
+    /// If you want to try and start the service on-demand, take a look at [`Self::connect`]
+    #[instrument]
+    pub async fn connect_to_running(&self) -> IoResult<S::ServiceClientConnection> {
+        self.bare_service
+            .connect_to_running_service(self.base_context_directory)
+            .await
+    }
+}
+
+/// Trait implemented by "bundles" of services that all work together and call each other.
+///
+/// Provides a unified interface for applying *base context directories* and *executor commands* to
+/// all of a collection of services, to then instantiate a defined service (these are inherent impl
+/// methods on generated types).
+pub trait ServiceBundle {
+    /// Create the service bundle with the given base context directory,
+    fn new(base_context_directory: &Path) -> Self;
+
+    /// Create the service bundle with the base context directory, along with an executor prefix
+    fn with_executor_prefix(base_context_directory: &Path, executor_prefix: &[&OsStr]) -> Self;
+}
+
+#[macro_export]
+/// A macro that aids in generating the common case of a service that has a command name and calls
+/// out to a command.
+///
+/// This creates unit-type items that implement the [`Service`] trait, where the services are
+/// started by standard [`std::process::Command`] execution - including correct executor prefix
+/// implementation.
+///
+/// Wrapping [`std::os::unix::net::UnixStream`]s in higher-level abstractions can be specified in a
+/// number of ways (in future, currently we only implement bare functions). These methods are
+/// called *USP*s (**U**nix **S**tream **P**reprocessors), of which there is currently one (though
+/// it should be able to implement any other with sufficient effort).
+///
+/// Using this macro goes something like the following:
+///
+/// ```rust
+/// use suss::declare_service;
+///
+/// declare_service! {
+///     /// My wonderful service
+///     pub WonderfulService = {
+///         "some-wonderful-command" [
+///             "always-present" "arguments" | "arguments" "before" "liveness"
+///             "path" "when" "present" {} "arguments" "after" "liveness" "path" "when"
+///             "present" | "always-present" "arguments"
+///         ] @ "unix-socket-filename.sock"
+///         as some_usp_method some_usp_method_specifications
+///     }
+/// }
+/// ```
+///
+/// Services are just unit types in this case, and can have any visibility you like and
+/// documentation or other things like `#[derive]` on them as desired.
+///
+/// The first part of the definition controls what command to run to execute the service. Inside
+/// the square brackets, there are 3 clear sections.
+///
+/// The first and last sections are arguments that are always present when executing the command.
+/// The middle section is arguments only present when that service is being passed a liveness socket
+/// path as documented in [`ServerService::run_server`]
+///
+/// The literal after the @ is the name of the socket within the *base context directory* that
+/// this service hosts itself upon. For example, if your base context directory is `/var/run`, and
+/// the socket name for a service is `hello-service.sock`, then the service should receive
+/// connections on `/var/run/hello-service.sock`.
+///
+/// Note that there is *no easy way* to pass in the base context directory to the command. This is
+/// a concious decision - this library is designed for *services*, not just *subprocesses*, and
+/// hence other programs should be able to find a service via some method derived from the
+/// environment.
+///
+/// If nothing else, storing a context directory in an environment variable will do
+/// the trick, but the point is that generally the base context directory should be defined by
+/// environment, whether that be `XDG`, or a global fixed directory, or an environment variable, or
+/// any combination of the above or some other environmental context.
+// TODO: Perhaps change liveness socket information to an environment variable to avoid polluting
+// the CLI?
+///
+/// This defines how a service is started and how to locate it. The stuff after the *as* provides
+/// information on what to do once you've got a connection.
+///
+/// ### Methods
+///
+/// #### Raw
+///
+/// The `raw` method is essentially an arbitrary function that takes a
+/// [`std::os::unix::net::UnixStream`] and produces (wrapped in a [`std::io::Result`]), a
+/// higher-level abstraction over the stream that the rest of the world will have access to.
+///
+/// ```rust
+///  ...rest-of-arg... as raw |name_of_raw_std_unix_socket_variable| -> Io<abstracted_and_wrapped_connection_type> {
+///     Ok(some_wrapped_type)
+///  }
+/// ```
+macro_rules! declare_service {
+    {
+        $(#[$service_meta:meta])*
+        $vis:vis $service_name:ident = {
+            $command:literal [ $($pre_args:literal)* | $($liveness_pre_args:literal)* {} $($liveness_post_args:literal)* | $($post_args:literal)* ] @ $socket_name:literal
+                as $unix_stream_preprocess_method:ident $($unix_stream_preprocess_spec:tt)*
+        }
+    } => {
+        $(#[$service_meta])*
+        #[derive(Debug)]
+        $vis struct $service_name;
+
+        impl $crate::Service for $service_name {
+            type ServiceClientConnection = $crate::declare_service!(@socket_connection_type $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*);
+
+            #[inline]
+            fn socket_name(&self) -> &::std::ffi::OsStr {
+                ::std::ffi::OsStr::new($socket_name)
+            }
+
+            #[inline]
+            fn wrap_connection(&self, bare_stream: ::std::os::unix::net::UnixStream) -> IoResult<Self::ServiceClientConnection> {
+                $crate::declare_service!(@wrap_implementation bare_stream $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*)
+            }
+
+            fn run_service_command_raw(
+                &self,
+                executor_commandline_prefix: ::core::option::Option<&[&::std::ffi::OsStr]>,
+                liveness_path: ::core::option::Option<&::std::path::Path>,
+            ) -> ::std::io::Result<::std::process::Child> {
+                use ::std::{process::Command, iter::{Iterator, IntoIterator, once}, ffi::OsStr};
+                // Build an iterator out of all the CLI components and unconditionally take the
+                // first. This ends up being generally simpler in the long run than trying to wrangle
+                // matches and conditional inclusion of items.
+                let mut all_components_iterator = executor_commandline_prefix
+                    .map(|l| l.iter().cloned()).into_iter()
+                    .flatten()
+                    // This is the part that ensures that at least the first element always exists.
+                    .chain(once(OsStr::new($command)))
+                    // Arguments before the condiitonal liveness
+                    .chain([$(OsStr::new($pre_args)),*].into_iter())
+                    // transform the liveness optional into an optional iterator, then flatten
+                    // because option is itself an iterator
+                    .chain(liveness_path.map(|real_liveness| {
+                        [$(OsStr::new($liveness_pre_args)),*].into_iter()
+                            .chain(once(real_liveness.as_os_str()))
+                            .chain([$(OsStr::new($liveness_post_args)),*])
+                    }).into_iter().flatten())
+                    // last arguments.
+                    .chain([$(OsStr::new($post_args)),*].into_iter());
+
+                let program = all_components_iterator.next().expect("There must be at least one thing in the iterator - the program to run, itself.");
+                Command::new(program)
+                    .args(all_components_iterator)
+                    .spawn()
+            }
+        }
+    };
+    // macro "method" for extracting the result type from the preprocess method and specification
+    {@socket_connection_type raw |$unix_socket:ident| -> Io<$result:ty> $body:block } => { $result };
+    // macro "method" for implementing the connection wrapper stuff
+    {@wrap_implementation $stream_ident:ident raw |$unix_socket:ident| -> Io<$result:ty> $body:block} => {{
+        let inner_closure = |$unix_socket| -> ::std::io::Result<$result> { $body };
+        inner_closure($stream_ident)
+    }};
+}
+
 /// Module for usually-necessary imports.
 pub mod prelude {
-    pub use super::{ServerService, Service, ServiceExt};
+    pub use super::declare_service;
+    pub use super::ServerService;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
+
+    use futures_lite::future::block_on;
+
     use super::*;
+
+    #[test]
+    pub fn service_declaration_and_start_fail_test() {
+        use std::os::unix::net::UnixStream;
+        let tmpdir = temp_dir();
+        declare_service! {
+            /// Basic test service
+            pub TestService = {
+                "sfdjfkosdgjsadgjlas" [| "--liveness" {} |] @ "test-service.sock" as raw |unix_socket| -> Io<UnixStream>  {
+                    Ok(unix_socket)
+                }
+            }
+        }
+
+        assert!(block_on(
+            TestService
+                .reify(&tmpdir)
+                .connect(Duration::from_millis(50))
+        )
+        .is_err());
+    }
 }
 
 // suss - library for creating single, directory namespaced unix socket servers in a network
