@@ -1,6 +1,10 @@
 # suss
 Suss is a library to create collections of unix services that can interact with each other and start each other on-demand.
 
+It is hosted at:
+* https://github.com/infomorphic-matti/suss
+* https://gitlab.com/infomorphic-matti/suss
+
 This library allows you to:
 * Define a list of services - and unix socket names - in a single location, along with an arbitrary interface wrapping a bare unix stream to act as a client connection, as well as a way to begin the service.
 * Provide implementations of the service in another package, or perhaps the same package in a different module. In theory, this will allow alternate implementations or perhaps test implementations to flourish, as long as the service can keep the clients happy.
