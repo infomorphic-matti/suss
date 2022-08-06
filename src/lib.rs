@@ -19,7 +19,7 @@ use cleanable_path::CleanablePathBuf;
 pub use futures_lite::future;
 
 use socket_shims::{DefaultUnixSocks, UnixSocketImplementation};
-use std::{fmt::Debug, future::Future, os::unix::net::UnixListener, path::Path};
+use std::{fmt::Debug, future::Future, os::unix::net::UnixListener, path::Path, ffi::OsStr};
 use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, time::Duration};
 use timefut::with_timeout;
 use tracing::{error, info, instrument, trace, warn};
@@ -33,6 +33,18 @@ use tracing::{error, info, instrument, trace, warn};
 /// allows multiple instances of collections of services without accidental interaction
 /// between the groups - for instance, if you wanted a service to run once per user, you
 /// could set the context directory as somewhere within $HOME or a per-user directory.
+///
+/// Services can also be provided an optional *executor prefix* - this is something that - in the
+/// case of command execution to start a service, should be added to the start of all service
+/// commands as the actual executable to run. This is useful for some cases:
+/// * It may be useful to run anything with a prefix of /usr/bin/env in certain operating
+/// environments like nixos
+/// * It can be used to override implementations with a custom version of certain services
+/// * It can be used to instrument services with some kind of notification or liveness system
+/// outside of the one internally managed by this process
+/// * Anything else you can think of, as long as it ends up delegating to something that actually
+/// runs a valid service, or maybe fails if you want to conditionally prevent services from
+/// functioning.
 ///
 /// Each service has an associated *socket name*, which is a place in the *context base path*
 /// that all services put their receiver unix sockets. Services are checked for running-status by
@@ -58,12 +70,17 @@ pub trait Service: Debug {
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service (probably by way of a command line
-    /// argument). The ephemeral socket path should be connected to and then immediately shut down
+    /// argument). 
+    ///
+    /// The provided executor argument list should be prefixed to any commandline executions if possible -
+    /// it provides a convenient means of allowing replaceable and instrumentable services.
+    ///
+    /// The ephemeral socket path should be connected to and then immediately shut down
     /// by the running service process (this is handled automatically by [`ServerService`] if you 
     /// use that to run your service).
     ///
     /// Ephemeral liveness check timeouts are applied by the library later on.
-    fn run_service_command_raw(&self, liveness_path: Option<&Path>) -> IoResult<Child>;
+    fn run_service_command_raw(&self, executor_commandline_prefix: Option<&[&OsStr]> , liveness_path: Option<&Path>) -> IoResult<Child>;
 
     /// This function is applied to the child process after it has passed the liveness check but
     /// before it has been connected to. In here you can add it to a threadpool or something if you want to
@@ -100,6 +117,8 @@ fn get_random_sockpath() -> std::path::PathBuf {
 pub trait ServiceExt: Service {
     /// Attempt to connect to an already running service. This will not try to start the service on
     /// failure - for that, see [`Self::connect_to_service`]
+    ///
+    /// See [`Service`] for information on base context directories.
     #[instrument]
     async fn connect_to_running_service(
         &self,
@@ -131,11 +150,15 @@ pub trait ServiceExt: Service {
 
     /// Attempt to connect to the given service in the given runtime context directory.
     ///
+    /// See [`Service`] for information on executor commandline prefixes and the base context
+    /// directory.
+    ///
     /// If the service is not already running, then `liveness_timeout` is the maximum time before a
     /// non-response to the liveness check will result in an error.
     #[instrument]
     async fn connect_to_service(
         &self,
+        executor_commandline_prefix: Option<&[&OsStr]>,
         base_context_directory: &Path,
         liveness_timeout: Duration,
     ) -> IoResult<<Self as Service>::ServiceClientConnection> {
@@ -165,7 +188,7 @@ pub trait ServiceExt: Service {
 
                 // We have an ephemeral socket, so begin running the child process, using `unblock`
                 let child_proc = self
-                    .run_service_command_raw(Some(ephemeral_socket_path.as_ref()))
+                    .run_service_command_raw(executor_commandline_prefix, Some(ephemeral_socket_path.as_ref()))
                     .map_err(|e| {
                         error!("Could not start child service process - {}", e);
                         e
@@ -237,6 +260,16 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
     /// (see [`Service`], in the current service namespace directory (the context base path). You
     /// must provide a means of converting a raw unix listener socket into a `SocketWrapper` that
     /// you can then use - this method can be fallible.
+    ///
+    /// In implementations, [`Service::SocketWrapper`] is generally some kind of higher-level
+    /// abstraction that provides things like RPC connection protocols or some kind of type
+    /// encoding/decoding overlay for the raw connection.
+    ///
+    /// This function is where such wrappers are created - though you can of course use an identity
+    /// function and work with raw sockets if you really want to all the way down. This function
+    /// currently is synchronous, but as far as the author of this library knows most async
+    /// runtimes allow easy translation between std sockets and the async sockets, so you can use
+    /// them at-will.
     #[instrument(skip(unix_listener_wrapping))]
     pub fn try_and_open_raw_socket(
         service: ServiceSpec,
@@ -252,7 +285,8 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
         })
     }
 
-    /// Runs an arbitrary async service server, consuming the service.
+    /// Runs an arbitrary async service server, consuming the service after performing relevant
+    /// liveness protocols.
     ///
     /// Arguments:
     ///  * the service function runs on the initially provided socket wrapper, and returns some
