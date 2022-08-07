@@ -18,7 +18,13 @@ use cleanable_path::CleanablePathBuf;
 pub use futures_lite::future;
 
 use socket_shims::{DefaultUnixSocks, UnixSocketImplementation};
-use std::{ffi::OsStr, fmt::Debug, future::Future, os::unix::net::UnixListener, path::Path};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt::Debug,
+    future::Future,
+    os::unix::net::UnixListener,
+    path::Path,
+};
 use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, time::Duration};
 use timefut::with_timeout;
 use tracing::{error, info, instrument, trace, warn};
@@ -86,7 +92,7 @@ pub trait Service: Debug + Sync {
     /// Ephemeral liveness check timeouts are applied by the library later on.
     fn run_service_command_raw(
         &self,
-        executor_commandline_prefix: Option<&[&OsStr]>,
+        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug + Sync]>,
         liveness_path: Option<&Path>,
     ) -> IoResult<Child>;
 
@@ -134,11 +140,11 @@ pub trait ServiceExt: Service {
 
     /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
     /// connecting to it, including an executor prefix command.
-    fn reify_with_executor<'i>(
+    fn reify_with_executor<'i, EPC: AsRef<OsStr> + Sized + Debug + Sync>(
         self,
         base_context_directory: &'i Path,
-        executor_prefix: &'i [&'i OsStr],
-    ) -> ReifiedService<'i, Self>
+        executor_prefix: &'i [EPC],
+    ) -> ReifiedService<'i, Self, EPC>
     where
         Self: Sized,
     {
@@ -188,7 +194,7 @@ pub trait ServiceExt: Service {
     #[instrument]
     async fn connect_to_service(
         &self,
-        executor_commandline_prefix: Option<&[&OsStr]>,
+        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug + Sync]>,
         base_context_directory: &Path,
         liveness_timeout: Duration,
     ) -> IoResult<<Self as Service>::ServiceClientConnection> {
@@ -392,13 +398,19 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
 /// This lets you interact with services in a manner not requiring you to carry around
 /// base_context_directories and executor_prefixes, and they are what [`ServiceBundle`]s produce
 /// for you under the hood.
-pub struct ReifiedService<'info, S: Service> {
-    executor_prefix: Option<&'info [&'info OsStr]>,
+pub struct ReifiedService<
+    'info,
+    S: Service,
+    ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug + Sync = OsString,
+> {
+    executor_prefix: Option<&'info [ExecutorPrefixComponent]>,
     base_context_directory: &'info Path,
     bare_service: S,
 }
 
-impl<'info, S: Service + Sync> ReifiedService<'info, S> {
+impl<'info, S: Service + Sync, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug + Sync>
+    ReifiedService<'info, S, ExecutorPrefixComponent>
+{
     /// Reify a service into a specific base context directory
     pub fn reify_service(service: S, base_context_directory: &'info Path) -> Self {
         Self {
@@ -412,7 +424,7 @@ impl<'info, S: Service + Sync> ReifiedService<'info, S> {
     pub fn reify_service_with_executor(
         service: S,
         base_context_directory: &'info Path,
-        executor_prefix: &'info [&'info OsStr],
+        executor_prefix: &'info [ExecutorPrefixComponent],
     ) -> Self {
         Self {
             executor_prefix: Some(executor_prefix),
@@ -458,12 +470,15 @@ impl<'info, S: Service + Sync> ReifiedService<'info, S> {
 /// Provides a unified interface for applying *base context directories* and *executor commands* to
 /// all of a collection of services, to then instantiate a defined service (these are inherent impl
 /// methods on generated types).
-pub trait ServiceBundle {
+pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString> {
     /// Create the service bundle with the given base context directory,
     fn new(base_context_directory: &Path) -> Self;
 
     /// Create the service bundle with the base context directory, along with an executor prefix
-    fn with_executor_prefix(base_context_directory: &Path, executor_prefix: &[&OsStr]) -> Self;
+    fn with_executor_prefix(
+        base_context_directory: &Path,
+        executor_prefix: &[ExecutorPrefixComponent],
+    ) -> Self;
 }
 
 #[macro_export]
@@ -567,7 +582,7 @@ macro_rules! declare_service {
 
             fn run_service_command_raw(
                 &self,
-                executor_commandline_prefix: ::core::option::Option<&[&::std::ffi::OsStr]>,
+                executor_commandline_prefix: ::core::option::Option<&[impl ::core::convert::AsRef<::std::ffi::OsStr> + ::std::fmt::Debug + ::core::marker::Sync]>,
                 liveness_path: ::core::option::Option<&::std::path::Path>,
             ) -> ::std::io::Result<::std::process::Child> {
                 use ::std::{process::Command, iter::{Iterator, IntoIterator, once}, ffi::OsStr};
@@ -575,8 +590,9 @@ macro_rules! declare_service {
                 // first. This ends up being generally simpler in the long run than trying to wrangle
                 // matches and conditional inclusion of items.
                 let mut all_components_iterator = executor_commandline_prefix
-                    .map(|l| l.iter().cloned()).into_iter()
+                    .map(|l| l.iter()).into_iter()
                     .flatten()
+                    .map(::core::convert::AsRef::as_ref)
                     // This is the part that ensures that at least the first element always exists.
                     .chain(once(OsStr::new($command)))
                     // Arguments before the condiitonal liveness
@@ -607,10 +623,102 @@ macro_rules! declare_service {
     }};
 }
 
+#[macro_export]
+/// This macro lets you create a service bundle, for unified initialisation of a collection of
+/// services.
+///
+/// The generated structure implements [`ServiceBundle`] as well as providing methods for reifying
+/// the services associated with it. Documentation for the services is attached to the service
+/// type.
+///
+/// For documentation on how service definitions work, see [`declare_service`]. The only difference
+/// is that instead of `pub ServiceTypeName = ` we have `pub service_bundle_function_name() -> ServiceTypeName = `
+///
+/// This is used like the following:
+/// ```rust
+/// use suss::{declare_service_bundle, ServiceBundle};
+///
+/// declare_service_bundle!{
+///     /// Some wonderful docs
+///     pub WonderfulServices {
+///         /// This is a wonderful service that prints hello
+///         pub fn wonderful_hello_service() -> WonderfulHelloService = { ... service_definition ... };
+///         /// This is a wonderful crate-private service that echos back written data
+///         pub(crate) fn wonderful_echo_service() -> WonderfulEchoService = { ... definition ... };
+///     }
+/// }
+///
+/// // If a service needs to be started, this is the time to wait before assuming there was an
+/// // error if the liveness socket doesn't get pinged
+/// let liveness_timeout = std::time::Duration::from_milli(500);
+///
+/// // Configure the shared runtime directory for all your services.
+/// let wonderful_bundle = WonderfulServices::new("/fancy/rumtime/base/directory");
+/// // Inside crate only
+/// let echo_api = wonderful_bundle.wonderful_echo_service().connect(liveness_timeout).await?;
+/// // public interface
+/// let hello_api = wonderful_bundle.wonderful_hello_service().connect(liveness_timeout).await?;
+/// // Try to connect to an already running service.
+/// let hello_api_two = wonderful_bundle.wonderful_hello_service().connect_to_running().await?;
+/// ```
+macro_rules! declare_service_bundle {
+    {
+        $(#[$bundle_meta:meta])*
+        $bundle_vis:vis $bundle_name:ident {$(
+            $(#[$service_meta:meta])*
+            $service_vis:vis fn $service_fn_name:ident () -> $service_type_name:ident = { $($service_definition:tt)*}
+        );*}
+    } => {
+
+        $(#[$bundle_meta])*
+        $bundle_vis struct $bundle_name {
+            executor_prefix: ::core::option::Option::<::std::vec::Vec::<::std::ffi::OsString>>,
+            base_context_path: ::std::path::PathBuf
+        }
+
+        impl $crate::ServiceBundle for $bundle_name {
+            fn new(base_context_path: &::std::path::Path) -> Self {
+                use ::std::borrow::ToOwned;
+                Self {
+                    base_context_path: base_context_path.to_owned(),
+                    executor_prefix: ::core::option::Option::None
+                }
+            }
+
+            fn with_executor_prefix(base_context_path: &::std::path::Path, executor_prefix: &[::std::ffi::OsString]) -> Self {
+                use ::std::borrow::ToOwned;
+                Self {
+                    base_context_path: base_context_path.to_owned(),
+                    executor_prefix: ::core::option::Option::Some(executor_prefix.to_owned())
+                }
+            }
+        }
+
+
+        // Implement service types by calling the declare_service! macro :)
+        $(
+            $crate::declare_service!{
+                $(#[$service_meta])*
+                $service_vis $service_type_name = { $($service_definition)* }
+            }
+        )*
+
+        // Now create the reification functions on our service bundle :)
+        impl $bundle_name {$(
+            $service_vis fn $service_fn_name(&self) -> $crate::ReifiedService<'_, $service_type_name> {
+                match &self.executor_prefix {
+                    Some(ep) => $crate::ReifiedService::reify_service_with_executor($service_type_name, &self.base_context_path, ep.as_slice()),
+                    None => $crate::ReifiedService::reify_service($service_type_name, &self.base_context_path)
+                }
+            }
+        )*}
+    }
+}
+
 /// Module for usually-necessary imports.
 pub mod prelude {
-    pub use super::declare_service;
     pub use super::ServerService;
+    pub use super::{declare_service, declare_service_bundle, ServiceBundle};
 }
 
 #[cfg(test)]
@@ -640,6 +748,36 @@ mod tests {
                 .connect(Duration::from_millis(50))
         )
         .is_err());
+    }
+
+    #[test]
+    pub fn service_bundle_macro_test() {
+        declare_service_bundle! {
+            pub TestBundle {
+                /// some service
+                pub fn echo_service() -> EchoService = {
+                    "echo-executable-wekdasjkfgnjsd" [|{}|] @ "echo-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
+                };
+                pub fn hello_service() -> HelloService = {
+                    "hello-executable-fjskldgkjsagd" [|{}|] @ "hello-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
+                }
+            }
+        }
+
+        let tmpdir = temp_dir();
+        let wonderful_bundle = TestBundle::new(&tmpdir);
+        assert!(block_on(
+            wonderful_bundle
+                .echo_service()
+                .connect(Duration::from_millis(50))
+        )
+        .is_err());
+        assert!(block_on(
+            wonderful_bundle
+                .hello_service()
+                .connect(Duration::from_millis(50))
+        )
+        .is_err())
     }
 }
 
