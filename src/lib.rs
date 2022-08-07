@@ -7,10 +7,52 @@
 //!
 //! To get started, take a look at the [`declare_service`] macro.
 
+/// Re-export of the chaining-transformation convenience functions crate.
+pub use chain_trans as chain_trans;
+
 mod cleanable_path;
 pub mod mapfut;
 pub mod socket_shims;
 pub mod timefut;
+
+pub mod liveness {
+    //! Module containing utilities for managing the liveness socket.
+
+    use std::{path::{Path, PathBuf}, process::Command};
+
+    /// Environment variable used by [`declare_service`] as a means of communicating the liveness
+    /// socket path.
+    pub const LIVENESS_ENV_VAR: &str = "SUSS_LIVENESS_SOCKET_PATH";
+
+    /// Ensure that, for the command given, the environment variable [`LIVENESS_ENV_VAR`] exists
+    /// with the correct liveness socket path as passed to this function, or if the liveness path
+    /// is None, ensures that the environment variable doesn't exist. This function is
+    /// automatically used with [`declare_service`]
+    ///
+    /// On a service server, see [`retrieve_liveness_path`] for obtaining the liveness path from
+    /// the environment and clearing the environment to avoid polluting child processes.
+    pub fn set_liveness_environment<'c>(
+        command: &'c mut Command,
+        child_liveness_path_state: Option<&Path>,
+    ) -> &'c mut Command {
+        match child_liveness_path_state {
+            Some(liveness_path) => command.env(LIVENESS_ENV_VAR, liveness_path.as_os_str()),
+            None => command.env_remove(LIVENESS_ENV_VAR),
+        }
+    }
+
+    /// Retrieve the liveness path from the environment in a server, and clear the environment of
+    /// the current process to avoid accidentally leaking the liveness environment into any child
+    /// processes started by the server.
+    ///
+    /// In your service declarations, use [`set_liveness_environment`] on your commands to
+    /// configure this to work.
+    pub fn retrieve_liveness_path() -> Option<PathBuf> {
+        let path = std::env::var_os(LIVENESS_ENV_VAR).map(PathBuf::from);
+        std::env::remove_var(LIVENESS_ENV_VAR);
+        path
+    }
+}
 
 /// Provide async_trait for convenience.
 pub use async_trait::async_trait;
@@ -79,8 +121,8 @@ pub trait Service: Debug + Sync {
     fn wrap_connection(&self, bare_stream: UnixStream) -> IoResult<Self::ServiceClientConnection>;
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
-    /// socket path passed through if present to that service (probably by way of a command line
-    /// argument).
+    /// socket path passed through if present to that service - in [`declare_service!`], this is
+    /// done with an environment variable.
     ///
     /// The provided executor argument list should be prefixed to any commandline executions if possible -
     /// it provides a convenient means of allowing replaceable and instrumentable services.
@@ -345,6 +387,9 @@ impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapp
     ///  Being unable to connect to the liveness path is not an error - the parent process probably
     ///  unexpectedly died, but the processes involved are generally speaking "persistent on-demand".
     ///  
+    ///  For information on the canonical way a parent service passes the liveness path to a child
+    ///  service process, see the [`liveness`] module. (in short, it uses an environment variable).
+    ///  
     ///  * `die_with_parent_prefailure` tells the server function to error out if a liveness path is
     ///  provided and yet the unix socket can't be connected to - probably something to do with the
     ///  parent process being dead. This ensures that there is an overlap in the lifetime of the
@@ -502,11 +547,7 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// declare_service! {
 ///     /// My wonderful service
 ///     pub WonderfulService = {
-///         "some-wonderful-command" [
-///             "always-present" "arguments" | "arguments" "before" "liveness"
-///             "path" "when" "present" {} "arguments" "after" "liveness" "path" "when"
-///             "present" | "always-present" "arguments"
-///         ] @ "unix-socket-filename.sock"
+///         "some-wonderful-command" "--and" "--commandline" "args" @ "unix-socket-filename.sock"
 ///         as some_usp_method some_usp_method_specifications
 ///     }
 /// }
@@ -515,12 +556,9 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// Services are just unit types in this case, and can have any visibility you like and
 /// documentation or other things like `#[derive]` on them as desired.
 ///
-/// The first part of the definition controls what command to run to execute the service. Inside
-/// the square brackets, there are 3 clear sections.
-///
-/// The first and last sections are arguments that are always present when executing the command.
-/// The middle section is arguments only present when that service is being passed a liveness socket
-/// path as documented in [`ServerService::run_server`]
+/// The first part of the definition controls what command to run to execute the service, and the
+/// socket it will serve on. The ephemeral liveness socket, as described in
+/// [`ServerService::run_server`], is passed through via an environment variable. 
 ///
 /// The literal after the @ is the name of the socket within the *base context directory* that
 /// this service hosts itself upon. For example, if your base context directory is `/var/run`, and
@@ -536,8 +574,6 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// the trick, but the point is that generally the base context directory should be defined by
 /// environment, whether that be `XDG`, or a global fixed directory, or an environment variable, or
 /// any combination of the above or some other environmental context.
-// TODO: Perhaps change liveness socket information to an environment variable to avoid polluting
-// the CLI?
 ///
 /// This defines how a service is started and how to locate it. The stuff after the *as* provides
 /// information on what to do once you've got a connection.
@@ -559,7 +595,7 @@ macro_rules! declare_service {
     {
         $(#[$service_meta:meta])*
         $vis:vis $service_name:ident = {
-            $command:literal [ $($pre_args:literal)* | $($liveness_pre_args:literal)* {} $($liveness_post_args:literal)* | $($post_args:literal)* ] @ $socket_name:literal
+            $command:literal $($args:literal)* @ $socket_name:literal
                 as $unix_stream_preprocess_method:ident $($unix_stream_preprocess_spec:tt)*
         }
     } => {
@@ -586,6 +622,7 @@ macro_rules! declare_service {
                 liveness_path: ::core::option::Option<&::std::path::Path>,
             ) -> ::std::io::Result<::std::process::Child> {
                 use ::std::{process::Command, iter::{Iterator, IntoIterator, once}, ffi::OsStr};
+                use $crate::chain_trans::prelude::*;
                 // Build an iterator out of all the CLI components and unconditionally take the
                 // first. This ends up being generally simpler in the long run than trying to wrangle
                 // matches and conditional inclusion of items.
@@ -595,20 +632,12 @@ macro_rules! declare_service {
                     .map(::core::convert::AsRef::as_ref)
                     // This is the part that ensures that at least the first element always exists.
                     .chain(once(OsStr::new($command)))
-                    // Arguments before the condiitonal liveness
-                    .chain([$(OsStr::new($pre_args)),*].into_iter())
-                    // transform the liveness optional into an optional iterator, then flatten
-                    // because option is itself an iterator
-                    .chain(liveness_path.map(|real_liveness| {
-                        [$(OsStr::new($liveness_pre_args)),*].into_iter()
-                            .chain(once(real_liveness.as_os_str()))
-                            .chain([$(OsStr::new($liveness_post_args)),*])
-                    }).into_iter().flatten())
-                    // last arguments.
-                    .chain([$(OsStr::new($post_args)),*].into_iter());
+                    // CLI args
+                    .chain([$(OsStr::new($args)),*].into_iter());
 
                 let program = all_components_iterator.next().expect("There must be at least one thing in the iterator - the program to run, itself.");
                 Command::new(program)
+                    .trans_mut(|cmd| { $crate::liveness::set_liveness_environment(cmd, liveness_path); })
                     .args(all_components_iterator)
                     .spawn()
             }
@@ -736,7 +765,7 @@ mod tests {
         declare_service! {
             /// Basic test service
             pub TestService = {
-                "sfdjfkosdgjsadgjlas" [| "--liveness" {} |] @ "test-service.sock" as raw |unix_socket| -> Io<UnixStream>  {
+                "sfdjfkosdgjsadgjlas" @ "test-service.sock" as raw |unix_socket| -> Io<UnixStream>  {
                     Ok(unix_socket)
                 }
             }
@@ -756,10 +785,10 @@ mod tests {
             pub TestBundle {
                 /// some service
                 pub fn echo_service() -> EchoService = {
-                    "echo-executable-wekdasjkfgnjsd" [|{}|] @ "echo-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
+                    "echo-executable-wekdasjkfgnjsd" "--and" "--some" "--args" @ "echo-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
                 };
                 pub fn hello_service() -> HelloService = {
-                    "hello-executable-fjskldgkjsagd" [|{}|] @ "hello-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
+                    "hello-executable-fjskldgkjsagd" "a" @ "hello-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
                 }
             }
         }
