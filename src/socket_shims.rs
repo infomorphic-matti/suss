@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use blocking::{unblock, Unblock};
 
 #[async_trait(?Send)]
-/// Provide a unified interface to unix sockets in various points of existence.
+/// Provide a unified interface to unix sockets in various points of existence. You can provide
+/// your own version of this in future if you have a runtime that is not supported.
 ///
 /// Note that this is very unideal... In future, I am likely to do a couple things:
 /// * Move the common interface out into a crate

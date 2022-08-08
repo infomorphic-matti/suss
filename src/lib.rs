@@ -63,16 +63,17 @@ use chain_trans::Trans;
 use cleanable_path::CleanablePathBuf;
 pub use futures_lite::future;
 
-use socket_shims::{DefaultUnixSocks, UnixSocketImplementation};
+pub use socket_shims::UnixSocketInterface;
+
 use std::{
     ffi::{OsStr, OsString},
     fmt::Debug,
-    os::unix::net::UnixListener,
+    marker::PhantomData,
     path::Path,
 };
-use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, time::Duration};
+use std::{io::Result as IoResult, process::Child, time::Duration};
 use timefut::with_timeout;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Trait used to define a single, startable service, with a relative socket path. For a more
 /// concise way of implementing services, take a look at the [`declare_service`] and
@@ -110,9 +111,9 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// are handled by a [`ServerExt`], which takes care of things like cleaning up socket files
 /// afterward automatically in [`Drop`]
 #[async_trait(?Send)]
-pub trait Service: Debug {
-    /// A connection to the service server - must be generatable from a bare
-    /// [`std::os::unix::net::UnixStream`]
+pub trait Service<UnixSockets: UnixSocketInterface>: Debug {
+    /// A connection to the service server - must be generatable from a stream as specified in the
+    /// unix socket interface parameters.
     type ServiceClientConnection;
 
     /// Obtain the name of the socket file in the base context path. In your collection of
@@ -121,7 +122,10 @@ pub trait Service: Debug {
     fn socket_name(&self) -> &std::ffi::OsStr;
 
     /// Convert a bare unix stream into a [`Self::ServiceClientConnection`]
-    fn wrap_connection(&self, bare_stream: UnixStream) -> IoResult<Self::ServiceClientConnection>;
+    async fn wrap_connection(
+        &self,
+        bare_stream: UnixSockets::UnixStream,
+    ) -> IoResult<Self::ServiceClientConnection>;
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service - in [`declare_service!`], this is
@@ -172,11 +176,82 @@ fn get_random_sockpath() -> std::path::PathBuf {
     path
 }
 
+/// Utility function that initiates a new ephemeral socket and return the ephemeral
+/// [`UnixSocketInterface::UnixListener`], as well as a self-cleaning path.
+///
+/// Call [`ephemeral_liveness_socket_check_with_timeout`] after starting the child process that's
+/// meant to ping the liveness socket.
+#[instrument]
+async fn ephemeral_liveness_socket_create<U: UnixSocketInterface>(
+) -> IoResult<(U::UnixListener, CleanablePathBuf)> {
+    let ephemeral_socket_path = CleanablePathBuf::new(get_random_sockpath());
+    info!(
+        "Creating ephemeral liveness socket @ {}",
+        ephemeral_socket_path.as_ref().display()
+    );
+    U::unix_listener_bind(ephemeral_socket_path.as_ref())
+        .await
+        .map_err(|e| {
+            error!(
+                "Couldn't create ephemeral liveness socket @ {} - {}",
+                ephemeral_socket_path.as_ref().display(),
+                e
+            );
+            e
+        })?
+        .trans(|ul| Ok((ul, ephemeral_socket_path)))
+}
+
+/// Wait for a connection ping on the liveness socket after starting the relevant process, with a
+/// timeout. Check out [`ephemeral_liveness_socket_create`].
+///
+/// If we failed, return an error - this includes timeouts as well.
+async fn ephemeral_liveness_socket_check_with_timeout<U: UnixSocketInterface>(
+    mut ephemeral_listener: U::UnixListener,
+    listener_path: CleanablePathBuf,
+    liveness_timeout: Duration,
+) -> IoResult<()> {
+    // Some(Result(temp stream)) if successful without timing out.
+    let maybe_temp_unix_stream = with_timeout(
+        U::unix_listener_accept(&mut ephemeral_listener),
+        liveness_timeout,
+    )
+    .await;
+    // If we timed out trying to accept some connection, we get None, so turn that into an Err() variant
+    let temp_unix_stream = maybe_temp_unix_stream.unwrap_or_else(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Timed out waiting for service to become live after {}",
+                humantime::format_duration(liveness_timeout)
+            ),
+        ))
+    });
+
+    // Log errors and forward them up to the caller.
+    let mut temp_unix_stream = temp_unix_stream
+        .map_err(|e| {
+            error!(
+                "Failed to receive liveness ping for service on ephemeral socket {} - {}",
+                listener_path.as_ref().display(),
+                e
+            );
+            e
+        })?
+        .trans(|(stream, _addr)| stream);
+
+    U::unix_stream_shutdown(&mut temp_unix_stream).await?;
+    // Clean up the path and delete the listener
+    drop(ephemeral_listener);
+    drop(listener_path);
+    Ok(())
+}
+
 #[async_trait(?Send)]
-pub trait ServiceExt: Service {
+pub trait ServiceExt<UnixSockets: UnixSocketInterface>: Service<UnixSockets> {
     /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
     /// connecting to it.
-    fn reify(self, base_context_directory: &Path) -> ReifiedService<'_, Self>
+    fn reify(self, base_context_directory: &Path) -> ReifiedService<'_, Self, UnixSockets>
     where
         Self: Sized,
     {
@@ -189,7 +264,7 @@ pub trait ServiceExt: Service {
         self,
         base_context_directory: &'i Path,
         executor_prefix: &'i [EPC],
-    ) -> ReifiedService<'i, Self, EPC>
+    ) -> ReifiedService<'i, Self, UnixSockets, EPC>
     where
         Self: Sized,
     {
@@ -204,29 +279,24 @@ pub trait ServiceExt: Service {
     async fn connect_to_running_service(
         &self,
         base_context_directory: &Path,
-    ) -> IoResult<<Self as Service>::ServiceClientConnection> {
-        use crate::socket_shims::UnixSocketImplementation;
-        let server_socket_path = base_context_directory.join(<Self as Service>::socket_name(self));
+    ) -> IoResult<Self::ServiceClientConnection> {
+        let server_socket_path = base_context_directory.join(Self::socket_name(self));
         info!(
             "Attempting connection to service @ {}",
             server_socket_path.display()
         );
-        match DefaultUnixSocks::us_connect(&server_socket_path).await {
-            Ok(non_std_unix_stream) => {
-                info!("Successfully obtained async unix socket");
-                trace!("Attempting conversion to std::os::unix::net::UnixStream");
-                let std_unix_stream = DefaultUnixSocks::us_to_std(non_std_unix_stream)?;
-                trace!("Wrapping into the final client connection...");
-                self.wrap_connection(std_unix_stream)
-            }
-            Err(e) => {
+        let unix_stream = UnixSockets::unix_stream_connect(&server_socket_path)
+            .await
+            .map_err(|e| {
                 error!(
                     "Failed to connect to service @ {}",
                     server_socket_path.display()
                 );
-                Err(e)
-            }
-        }
+                e
+            })?;
+
+        info!("Successfully connected @ {}", server_socket_path.display());
+        self.wrap_connection(unix_stream).await
     }
 
     /// Attempt to connect to the given service in the given runtime context directory.
@@ -242,8 +312,7 @@ pub trait ServiceExt: Service {
         executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug]>,
         base_context_directory: &Path,
         liveness_timeout: Duration,
-    ) -> IoResult<<Self as Service>::ServiceClientConnection> {
-        use socket_shims::UnixSocketImplementation;
+    ) -> IoResult<Self::ServiceClientConnection> {
         match self
             .connect_to_running_service(base_context_directory)
             .await
@@ -251,21 +320,8 @@ pub trait ServiceExt: Service {
             Ok(s) => Ok(s),
             Err(e) => {
                 warn!("Error connecting to existing service - {} - attempting on-demand service start", e);
-                let ephemeral_socket_path = CleanablePathBuf::new(get_random_sockpath());
-                info!(
-                    "Creating ephemeral liveness socket @ {}",
-                    ephemeral_socket_path.as_ref().display()
-                );
-                let ephem = DefaultUnixSocks::ul_bind(ephemeral_socket_path.as_ref())
-                    .await
-                    .map_err(|e| {
-                        error!(
-                            "Couldn't create ephemeral liveness socket @ {} - {}",
-                            ephemeral_socket_path.as_ref().display(),
-                            e
-                        );
-                        e
-                    })?;
+                let (ephemeral_listener, ephemeral_socket_path) =
+                    ephemeral_liveness_socket_create::<UnixSockets>().await?;
 
                 // We have an ephemeral socket, so begin running the child process, using `unblock`
                 let child_proc = self
@@ -278,34 +334,12 @@ pub trait ServiceExt: Service {
                         e
                     })?;
 
-                // Now wait for a liveness ping
-                let mut temp_unix_stream = with_timeout(
-                    DefaultUnixSocks::ul_try_accept_connection(&ephem),
+                ephemeral_liveness_socket_check_with_timeout::<UnixSockets>(
+                    ephemeral_listener,
+                    ephemeral_socket_path,
                     liveness_timeout,
                 )
-                .await
-                .unwrap_or_else(|| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "Timed out waiting for service to become live after {}",
-                            humantime::format_duration(liveness_timeout)
-                        ),
-                    ))
-                })
-                .map_err(|e| {
-                    error!(
-                        "Failed to receive liveness ping for service on ephemeral socket {} - {}",
-                        ephemeral_socket_path.as_ref().display(),
-                        e
-                    );
-                    e
-                })?;
-
-                DefaultUnixSocks::us_shutdown(&mut temp_unix_stream).await?;
-                drop(temp_unix_stream);
-                drop(ephem);
-                drop(ephemeral_socket_path);
+                .await?;
 
                 self.after_post_liveness_subprocess(child_proc).await?;
                 info!("Successfully received ephemeral liveness ping - trying to connect to service again.");
@@ -316,11 +350,11 @@ pub trait ServiceExt: Service {
     }
 }
 
-impl<S: Service> ServiceExt for S {}
+impl<U: UnixSocketInterface, S: Service<U>> ServiceExt<U> for S {}
 
 /// Server implementation for a [`Service`]
 #[async_trait]
-pub trait Server<S: Service>: Debug {
+pub trait Server<S: Service<U>, U: UnixSocketInterface>: Debug {
     /// Type that wraps a unix socket listener.
     type ListenerWrapper;
     type FinalOutput;
@@ -333,7 +367,7 @@ pub trait Server<S: Service>: Debug {
     async fn wrap_listener_socket(
         &self,
         service: &S,
-        socket: UnixListener,
+        socket: U::UnixListener,
     ) -> IoResult<Self::ListenerWrapper>;
 
     /// Run the server. Note that you don't need to worry about cleaning up the socket path - that's
@@ -350,8 +384,10 @@ pub trait Server<S: Service>: Debug {
 ///
 /// This will report any io errors but you probably don't care about those.
 #[instrument]
-async fn notify_liveness_socket(liveness_socket_path: &Path) -> IoResult<()> {
-    let mut sock = DefaultUnixSocks::us_connect(liveness_socket_path).await
+async fn notify_liveness_socket<U: UnixSocketInterface>(
+    liveness_socket_path: &Path,
+) -> IoResult<()> {
+    let mut sock = U::unix_stream_connect(liveness_socket_path).await
         .map_err(|e| {
             warn!("Couldn't connect to parent process's ephemeral liveness socket @ {} - error was: {}", liveness_socket_path.display(), e);
             e
@@ -361,18 +397,18 @@ async fn notify_liveness_socket(liveness_socket_path: &Path) -> IoResult<()> {
                 liveness_socket_path.display()
             );
         });
-    DefaultUnixSocks::us_shutdown(&mut sock).await
+    U::unix_stream_shutdown(&mut sock).await
 }
 
 /// Extension trait that lets you run servers well
 #[async_trait(?Send)]
-pub trait ServerExt<S: Service>: Server<S> {
+pub trait ServerExt<S: Service<U>, U: UnixSocketInterface>: Server<S, U> {
     /// Create the listener socket, notify the liveness socket, and when finally returning, clean the listener socket up after ourselves.
     ///
     /// ## Methods used to create sockets
-    /// This function currently uses [`socket_shims::DefaultUnixSocks`] for managing asynchronous
-    /// connections, and passes around standard library sockets which can be freely converted back
-    /// and forth to async frameworks.
+    /// This uses the functions defined by the parameterised [`UnixSocketInterface`]. If you want
+    /// to make services or servers generic over different async frameworks, being generic over
+    /// that parameter is useful.
     ///
     /// ## Liveness Socket
     /// This library uses an ephemeral unix socket started by a parent process as a means to
@@ -393,13 +429,14 @@ pub trait ServerExt<S: Service>: Server<S> {
         liveness_socket_path: Option<&Path>,
     ) -> IoResult<Self::FinalOutput> {
         let socket_path: CleanablePathBuf = context_base_path.join(service.socket_name()).into();
+        info!("Obtaining socket @ {}", socket_path.as_ref().display());
+        let raw_listener_socket = U::unix_listener_bind(socket_path.as_ref()).await?;
         info!(
-            "Obtaining socket on path {}",
+            "Successfully listening @ {}",
             socket_path.as_ref().display()
         );
-        let raw_listener_socket = DefaultUnixSocks::ul_bind(socket_path.as_ref()).await?;
         let _ = match liveness_socket_path {
-            Some(p) => notify_liveness_socket(p).await,
+            Some(p) => notify_liveness_socket::<U>(p).await,
             None => {
                 info!("No liveness socket path provided, assuming autonomous.");
                 Ok(())
@@ -408,7 +445,7 @@ pub trait ServerExt<S: Service>: Server<S> {
 
         debug!("Wrapping raw socket in API");
         let api = self
-            .wrap_listener_socket(service, DefaultUnixSocks::ul_to_std(raw_listener_socket)?)
+            .wrap_listener_socket(service, raw_listener_socket)
             .await?;
         info!("Starting service @ {}", socket_path.as_ref().display());
         let res = self.run_server(service, api).await?;
@@ -418,9 +455,8 @@ pub trait ServerExt<S: Service>: Server<S> {
     }
 }
 
-impl<S: Service, T: Server<S>> ServerExt<S> for T {}
+impl<U: UnixSocketInterface, S: Service<U>, T: Server<S, U>> ServerExt<S, U> for T {}
 
-#[derive(Debug)]
 /// Holds a particular instance of a [`Service`], along with a base context directory and optional
 /// executor prefix.
 ///
@@ -429,16 +465,38 @@ impl<S: Service, T: Server<S>> ServerExt<S> for T {}
 /// for you under the hood.
 pub struct ReifiedService<
     'info,
-    S: Service,
+    S: Service<U>,
+    U: UnixSocketInterface,
     ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug = OsString,
 > {
     executor_prefix: Option<&'info [ExecutorPrefixComponent]>,
     base_context_directory: &'info Path,
     bare_service: S,
+    _unix_socket_iface: PhantomData<U>,
 }
 
-impl<'info, S: Service, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug>
-    ReifiedService<'info, S, ExecutorPrefixComponent>
+impl<
+        'info,
+        S: Service<U>,
+        U: UnixSocketInterface,
+        ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug,
+    > Debug for ReifiedService<'info, S, U, ExecutorPrefixComponent>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReifiedService")
+            .field("executor_prefix", &self.executor_prefix)
+            .field("base_context_directory", &self.base_context_directory)
+            .field("bare_service", &self.bare_service)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<
+        'info,
+        S: Service<U>,
+        U: UnixSocketInterface,
+        ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug,
+    > ReifiedService<'info, S, U, ExecutorPrefixComponent>
 {
     /// Reify a service into a specific base context directory
     pub fn reify_service(service: S, base_context_directory: &'info Path) -> Self {
@@ -446,6 +504,7 @@ impl<'info, S: Service, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug>
             executor_prefix: None,
             base_context_directory,
             bare_service: service,
+            _unix_socket_iface: PhantomData,
         }
     }
 
@@ -459,6 +518,7 @@ impl<'info, S: Service, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug>
             executor_prefix: Some(executor_prefix),
             base_context_directory,
             bare_service: service,
+            _unix_socket_iface: PhantomData,
         }
     }
 
@@ -496,7 +556,7 @@ impl<'info, S: Service, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug>
     #[instrument]
     /// Run an actual server for this service, with a provided implementation and optional [`liveness`]
     /// socket path.
-    pub async fn serve_service_implementation<ServiceServer: ServerExt<S>>(
+    pub async fn serve_service_implementation<ServiceServer: ServerExt<S, U>>(
         &self,
         server: &ServiceServer,
         liveness_socket_path: Option<&Path>,
@@ -547,10 +607,10 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 ///
 /// declare_service! {
 ///     /// My wonderful service
-///     pub WonderfulService = {
+///     pub WonderfulService <unix stream interface type name> = {
 ///         "some-wonderful-command" "--and" "--commandline" "args" @ "unix-socket-filename.sock"
 ///         as some_usp_method some_usp_method_specifications
-///     }
+///     } $(impl { type-parameters-and-constraints-that-go-in-<-and-> }, optional)
 /// }
 /// ```
 ///
@@ -584,27 +644,33 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// #### Raw
 ///
 /// The `raw` method is essentially an arbitrary function that takes a
-/// [`std::os::unix::net::UnixStream`] and produces (wrapped in a [`std::io::Result`]), a
+/// [`UnixSocketInterface::UnixStream`] and produces (wrapped in a [`std::io::Result`]), a
 /// higher-level abstraction over the stream that the rest of the world will have access to.
 ///
 /// ```rust,compile_fail
 ///  ...rest-of-arg... as raw |name_of_raw_std_unix_socket_variable| -> Io<abstracted_and_wrapped_connection_type> {
 ///     Ok(some_wrapped_type)
-///  }
+///  } ...
 /// ```
+///
+/// You can either implement a service over a specific socket implementation - either one of those
+/// defined in [`socket_shims`] or even your own custom implementation - or you can make a service
+/// generic over all of them by including some impl <...> parameters and constraints after the
+/// method. These go inside {} rather than <> due to macro constraints.
 macro_rules! declare_service {
     {
         $(#[$service_meta:meta])*
-        $vis:vis $service_name:ident = {
+        $vis:vis $service_name:ident <$unix_sock_impl:ty> = {
             $command:literal $($args:literal)* @ $socket_name:literal
                 as $unix_stream_preprocess_method:ident $($unix_stream_preprocess_spec:tt)*
-        }
+        } $(impl {$($typeparam_constraints:tt)*})?
     } => {
         $(#[$service_meta])*
         #[derive(Debug)]
         $vis struct $service_name;
 
-        impl $crate::Service for $service_name {
+        #[$crate::async_trait(?Send)]
+        impl $(<$($typeparam_constraints)*>)? $crate::Service <$unix_sock_impl> for $service_name {
             type ServiceClientConnection = $crate::declare_service!(@socket_connection_type $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*);
 
             #[inline]
@@ -613,7 +679,7 @@ macro_rules! declare_service {
             }
 
             #[inline]
-            fn wrap_connection(&self, bare_stream: ::std::os::unix::net::UnixStream) -> IoResult<Self::ServiceClientConnection> {
+            async fn wrap_connection(&self, bare_stream: <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream) -> IoResult<Self::ServiceClientConnection> {
                 $crate::declare_service!(@wrap_implementation bare_stream $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*)
             }
 
@@ -649,7 +715,7 @@ macro_rules! declare_service {
     // macro "method" for implementing the connection wrapper stuff
     {@wrap_implementation $stream_ident:ident raw |$unix_socket:ident| -> Io<$result:ty> $body:block} => {{
         let inner_closure = |$unix_socket| -> ::std::io::Result<$result> { $body };
-        inner_closure($stream_ident)
+        async { inner_closure($stream_ident) }.await
     }};
 }
 
@@ -662,7 +728,8 @@ macro_rules! declare_service {
 /// type.
 ///
 /// For documentation on how service definitions work, see [`declare_service`]. The only difference
-/// is that instead of `pub ServiceTypeName = ` we have `pub service_bundle_function_name() -> ServiceTypeName = `
+/// is that instead of `pub ServiceTypeName <unix socket interface type> = ` we
+/// have `pub service_bundle_function_name() -> ServiceTypeName <unix socket interface type> = `
 ///
 /// This is used like the following:
 /// ```rust,compile_fail
@@ -672,9 +739,9 @@ macro_rules! declare_service {
 ///     /// Some wonderful docs
 ///     pub WonderfulServices {
 ///         /// This is a wonderful service that prints hello
-///         pub fn wonderful_hello_service() -> WonderfulHelloService = { ... service_definition ... };
+///         pub fn wonderful_hello_service() -> WonderfulHelloService<U> = { ... service_definition ... } impl {U: UnixSocketInterface};
 ///         /// This is a wonderful crate-private service that echos back written data
-///         pub(crate) fn wonderful_echo_service() -> WonderfulEchoService = { ... definition ... };
+///         pub(crate) fn wonderful_echo_service() -> WonderfulEchoService <U> = { ... definition ... };
 ///     }
 /// }
 ///
@@ -696,14 +763,15 @@ macro_rules! declare_service_bundle {
         $(#[$bundle_meta:meta])*
         $bundle_vis:vis $bundle_name:ident {$(
             $(#[$service_meta:meta])*
-            $service_vis:vis fn $service_fn_name:ident () -> $service_type_name:ident = { $($service_definition:tt)*}
+            $service_vis:vis fn $service_fn_name:ident () -> $service_type_name:ident <$unix_sock_impl:ty> = { $($service_definition:tt)*}
+                $(impl { $($unix_sock_constraints:tt)* })?
         );*}
     } => {
 
         $(#[$bundle_meta])*
         $bundle_vis struct $bundle_name {
             executor_prefix: ::core::option::Option::<::std::vec::Vec::<::std::ffi::OsString>>,
-            base_context_path: ::std::path::PathBuf
+            base_context_path: ::std::path::PathBuf,
         }
 
         impl $crate::ServiceBundle for $bundle_name {
@@ -719,7 +787,7 @@ macro_rules! declare_service_bundle {
                 use ::std::borrow::ToOwned;
                 Self {
                     base_context_path: base_context_path.to_owned(),
-                    executor_prefix: ::core::option::Option::Some(executor_prefix.to_owned())
+                    executor_prefix: ::core::option::Option::Some(executor_prefix.to_owned()),
                 }
             }
         }
@@ -729,13 +797,13 @@ macro_rules! declare_service_bundle {
         $(
             $crate::declare_service!{
                 $(#[$service_meta])*
-                $service_vis $service_type_name = { $($service_definition)* }
+                $service_vis $service_type_name <$unix_sock_impl> = { $($service_definition)* } $(impl {$($unix_sock_constraints)*})?
             }
         )*
 
         // Now create the reification functions on our service bundle :)
         impl $bundle_name {$(
-            $service_vis fn $service_fn_name(&self) -> $crate::ReifiedService<'_, $service_type_name> {
+            $service_vis fn $service_fn_name $(<$($unix_sock_constraints)*>)? (&self) -> $crate::ReifiedService<'_, $service_type_name, $unix_sock_impl> {
                 match &self.executor_prefix {
                     Some(ep) => $crate::ReifiedService::reify_service_with_executor($service_type_name, &self.base_context_path, ep.as_slice()),
                     None => $crate::ReifiedService::reify_service($service_type_name, &self.base_context_path)
@@ -756,19 +824,20 @@ mod tests {
 
     use futures_lite::future::block_on;
 
+    use crate::socket_shims::StdThreadpoolUSocks;
+
     use super::*;
 
     #[test]
     pub fn service_declaration_and_start_fail_test() {
-        use std::os::unix::net::UnixStream;
         let tmpdir = temp_dir();
         declare_service! {
             /// Basic test service
-            pub TestService = {
-                "sfdjfkosdgjsadgjlas" @ "test-service.sock" as raw |unix_socket| -> Io<UnixStream>  {
+            pub TestService <U> = {
+                "sfdjfkosdgjsadgjlas" @ "test-service.sock" as raw |unix_socket| -> Io<U::UnixStream>  {
                     Ok(unix_socket)
                 }
-            }
+            } impl {U: UnixSocketInterface}
         }
 
         assert!(block_on(
@@ -784,12 +853,13 @@ mod tests {
         declare_service_bundle! {
             pub TestBundle {
                 /// some service
-                pub fn echo_service() -> EchoService = {
-                    "echo-executable-wekdasjkfgnjsd" "--and" "--some" "--args" @ "echo-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
+                pub fn echo_service() -> EchoService <StdThreadpoolUSocks> = {
+                    "echo-executable-wekdasjkfgnjsd" "--and" "--some" "--args" @ "echo-service.sock" as raw |unix_socket| ->
+                        Io< <StdThreadpoolUSocks as UnixSocketInterface>::UnixStream> { Ok(unix_socket) }
                 };
-                pub fn hello_service() -> HelloService = {
-                    "hello-executable-fjskldgkjsagd" "a" @ "hello-service.sock" as raw |unix_socket| -> Io<UnixStream> { Ok(unix_socket) }
-                }
+                pub fn hello_service() -> HelloService<U> = {
+                    "hello-executable-fjskldgkjsagd" "a" @ "hello-service.sock" as raw |unix_socket| -> Io<U::UnixStream> { Ok(unix_socket) }
+                } impl {U: UnixSocketInterface}
             }
         }
 
