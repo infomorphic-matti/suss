@@ -67,7 +67,6 @@ use socket_shims::{DefaultUnixSocks, UnixSocketImplementation};
 use std::{
     ffi::{OsStr, OsString},
     fmt::Debug,
-    future::Future,
     os::unix::net::UnixListener,
     path::Path,
 };
@@ -110,11 +109,11 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// Socket files, actually running the service, etc. are not handled by this trait. Instead, they
 /// are handled by a [`ServerExt`], which takes care of things like cleaning up socket files
 /// afterward automatically in [`Drop`]
-#[async_trait]
-pub trait Service: Debug + Sync {
+#[async_trait(?Send)]
+pub trait Service: Debug {
     /// A connection to the service server - must be generatable from a bare
     /// [`std::os::unix::net::UnixStream`]
-    type ServiceClientConnection: Send;
+    type ServiceClientConnection;
 
     /// Obtain the name of the socket file in the base context path. In your collection of
     /// services, the result should be unique, or you might end up with service collisions when
@@ -138,7 +137,7 @@ pub trait Service: Debug + Sync {
     /// Ephemeral liveness check timeouts are applied by the library later on.
     fn run_service_command_raw(
         &self,
-        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug + Sync]>,
+        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug]>,
         liveness_path: Option<&Path>,
     ) -> IoResult<Child>;
 
@@ -173,7 +172,7 @@ fn get_random_sockpath() -> std::path::PathBuf {
     path
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait ServiceExt: Service {
     /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
     /// connecting to it.
@@ -186,7 +185,7 @@ pub trait ServiceExt: Service {
 
     /// Reify this [`Service`] into a [`ReifiedService`] that carries around necessary context for
     /// connecting to it, including an executor prefix command.
-    fn reify_with_executor<'i, EPC: AsRef<OsStr> + Sized + Debug + Sync>(
+    fn reify_with_executor<'i, EPC: AsRef<OsStr> + Sized + Debug>(
         self,
         base_context_directory: &'i Path,
         executor_prefix: &'i [EPC],
@@ -240,7 +239,7 @@ pub trait ServiceExt: Service {
     #[instrument]
     async fn connect_to_service(
         &self,
-        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug + Sync]>,
+        executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug]>,
         base_context_directory: &Path,
         liveness_timeout: Duration,
     ) -> IoResult<<Self as Service>::ServiceClientConnection> {
@@ -431,14 +430,14 @@ impl<S: Service, T: Server<S>> ServerExt<S> for T {}
 pub struct ReifiedService<
     'info,
     S: Service,
-    ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug + Sync = OsString,
+    ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug = OsString,
 > {
     executor_prefix: Option<&'info [ExecutorPrefixComponent]>,
     base_context_directory: &'info Path,
     bare_service: S,
 }
 
-impl<'info, S: Service + Sync, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug + Sync>
+impl<'info, S: Service, ExecutorPrefixComponent: AsRef<OsStr> + Sized + Debug>
     ReifiedService<'info, S, ExecutorPrefixComponent>
 {
     /// Reify a service into a specific base context directory
@@ -505,7 +504,7 @@ impl<'info, S: Service + Sync, ExecutorPrefixComponent: AsRef<OsStr> + Sized + D
         server
             .start_and_run_server(
                 &self.bare_service,
-                &self.base_context_directory,
+                self.base_context_directory,
                 liveness_socket_path,
             )
             .await
@@ -620,7 +619,7 @@ macro_rules! declare_service {
 
             fn run_service_command_raw(
                 &self,
-                executor_commandline_prefix: ::core::option::Option<&[impl ::core::convert::AsRef<::std::ffi::OsStr> + ::std::fmt::Debug + ::core::marker::Sync]>,
+                executor_commandline_prefix: ::core::option::Option<&[impl ::core::convert::AsRef<::std::ffi::OsStr> + ::std::fmt::Debug]>,
                 liveness_path: ::core::option::Option<&::std::path::Path>,
             ) -> ::std::io::Result<::std::process::Child> {
                 use ::std::{process::Command, iter::{Iterator, IntoIterator, once}, ffi::OsStr};
