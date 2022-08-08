@@ -8,7 +8,7 @@
 //! To get started, take a look at the [`declare_service`] macro.
 
 /// Re-export of the chaining-transformation convenience functions crate.
-pub use chain_trans as chain_trans;
+pub use chain_trans;
 
 mod cleanable_path;
 pub mod mapfut;
@@ -18,7 +18,10 @@ pub mod timefut;
 pub mod liveness {
     //! Module containing utilities for managing the liveness socket.
 
-    use std::{path::{Path, PathBuf}, process::Command};
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     /// Environment variable used by [`declare_service`] as a means of communicating the liveness
     /// socket path.
@@ -508,6 +511,22 @@ impl<'info, S: Service + Sync, ExecutorPrefixComponent: AsRef<OsStr> + Sized + D
             .connect_to_running_service(self.base_context_directory)
             .await
     }
+
+    /// Create a [`ServerService`] - including original socket initialisation - for this service.
+    ///
+    /// See [`liveness`] and function documentation for info on what to pass to the function
+    /// [`ServerService::run_server`]
+    #[instrument(skip(listener_socket_wrapper))]
+    pub fn initialise_server<ServerSocketWrapper>(
+        self,
+        listener_socket_wrapper: impl FnOnce(UnixListener) -> IoResult<ServerSocketWrapper>,
+    ) -> IoResult<ServerService<S, ServerSocketWrapper>> {
+        ServerService::try_and_open_raw_socket(
+            self.bare_service,
+            self.base_context_directory,
+            listener_socket_wrapper,
+        )
+    }
 }
 
 /// Trait implemented by "bundles" of services that all work together and call each other.
@@ -558,7 +577,7 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 ///
 /// The first part of the definition controls what command to run to execute the service, and the
 /// socket it will serve on. The ephemeral liveness socket, as described in
-/// [`ServerService::run_server`], is passed through via an environment variable. 
+/// [`ServerService::run_server`], is passed through via an environment variable.
 ///
 /// The literal after the @ is the name of the socket within the *base context directory* that
 /// this service hosts itself upon. For example, if your base context directory is `/var/run`, and
