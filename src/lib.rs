@@ -23,14 +23,14 @@ pub mod liveness {
         process::Command,
     };
 
-    /// Environment variable used by [`declare_service`] as a means of communicating the liveness
+    /// Environment variable used by [`super::declare_service`] as a means of communicating the liveness
     /// socket path.
     pub const LIVENESS_ENV_VAR: &str = "SUSS_LIVENESS_SOCKET_PATH";
 
     /// Ensure that, for the command given, the environment variable [`LIVENESS_ENV_VAR`] exists
     /// with the correct liveness socket path as passed to this function, or if the liveness path
     /// is None, ensures that the environment variable doesn't exist. This function is
-    /// automatically used with [`declare_service`]
+    /// automatically used with [`super::declare_service`]
     ///
     /// On a service server, see [`retrieve_liveness_path`] for obtaining the liveness path from
     /// the environment and clearing the environment to avoid polluting child processes.
@@ -59,6 +59,7 @@ pub mod liveness {
 
 /// Provide async_trait for convenience.
 pub use async_trait::async_trait;
+use chain_trans::Trans;
 use cleanable_path::CleanablePathBuf;
 pub use futures_lite::future;
 
@@ -72,7 +73,7 @@ use std::{
 };
 use std::{io::Result as IoResult, os::unix::net::UnixStream, process::Child, time::Duration};
 use timefut::with_timeout;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 /// Trait used to define a single, startable service, with a relative socket path. For a more
 /// concise way of implementing services, take a look at the [`declare_service`] and
@@ -107,7 +108,7 @@ use tracing::{error, info, instrument, trace, warn};
 /// `UnixStream` and if it fails, try to start the service.
 ///
 /// Socket files, actually running the service, etc. are not handled by this trait. Instead, they
-/// are handled by a [`ServerService`], which takes care of things like cleaning up socket files
+/// are handled by a [`ServerExt`], which takes care of things like cleaning up socket files
 /// afterward automatically in [`Drop`]
 #[async_trait]
 pub trait Service: Debug + Sync {
@@ -131,7 +132,7 @@ pub trait Service: Debug + Sync {
     /// it provides a convenient means of allowing replaceable and instrumentable services.
     ///
     /// The ephemeral socket path should be connected to and then immediately shut down
-    /// by the running service process (this is handled automatically by [`ServerService`] if you
+    /// by the running service process (this is handled automatically by [`ServiceExt`] if you
     /// use that to run your service).
     ///
     /// Ephemeral liveness check timeouts are applied by the library later on.
@@ -318,126 +319,107 @@ pub trait ServiceExt: Service {
 
 impl<S: Service> ServiceExt for S {}
 
-/// Represents a running service on a [`UnixListener`]. The unix socket can be preprocessed and
-/// wrapped in some other type that may encapsulate listening behaviour beyond bare socket
-/// communication.
+/// Server implementation for a [`Service`]
+#[async_trait]
+pub trait Server<S: Service>: Debug {
+    /// Type that wraps a unix socket listener.
+    type ListenerWrapper;
+    type FinalOutput;
+
+    /// Wrap a listening socket into a more structured form - for instance an API wrapper or
+    /// something similar.
+    ///
+    /// This takes a raw [`UnixListener`]. Async frameworks should let you convert to and from
+    /// standard library unix sockets.
+    async fn wrap_listener_socket(
+        &self,
+        service: &S,
+        socket: UnixListener,
+    ) -> IoResult<Self::ListenerWrapper>;
+
+    /// Run the server. Note that you don't need to worry about cleaning up the socket path - that's
+    /// handled by the library.
+    async fn run_server(
+        &self,
+        service: &S,
+        wrapper: Self::ListenerWrapper,
+    ) -> IoResult<Self::FinalOutput>;
+}
+
+/// Internal function to notify a liveness socket by connecting and then immediately disconnecting
+/// :)
 ///
-/// When this object is consumed, it will destroy the unix listener and delete the socket file
-/// automatically.
-pub struct ServerService<ServiceSpec: Service, SocketWrapper = UnixListener> {
-    service: ServiceSpec,
-    unix_listener_socket: SocketWrapper,
-    socket_path: CleanablePathBuf,
+/// This will report any io errors but you probably don't care about those.
+#[instrument]
+async fn notify_liveness_socket(liveness_socket_path: &Path) -> IoResult<()> {
+    let mut sock = DefaultUnixSocks::us_connect(liveness_socket_path).await
+        .map_err(|e| {
+            warn!("Couldn't connect to parent process's ephemeral liveness socket @ {} - error was: {}", liveness_socket_path.display(), e);
+            e
+        })?.trans_inspect(|_sock| {
+            info!(
+                "Ping'ed liveness socket @ {} with connection, shutting ephemeral connection.",
+                liveness_socket_path.display()
+            );
+        });
+    DefaultUnixSocks::us_shutdown(&mut sock).await
 }
 
-impl<ServiceSpec: Service, SocketWrapper> Debug for ServerService<ServiceSpec, SocketWrapper> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerService")
-            .field("service", &self.service)
-            .field("socket_path", &self.socket_path)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<ServiceSpec: Service, SocketWrapper> ServerService<ServiceSpec, SocketWrapper> {
-    /// This attempts to initially open the unix socket with the name appropriate to the service
-    /// (see [`Service`]), in the current service namespace directory (the context base path). You
-    /// must provide a means of converting a raw unix listener socket into a `SocketWrapper` that
-    /// you can then use - this method can be fallible.
+/// Extension trait that lets you run servers well
+#[async_trait(?Send)]
+pub trait ServerExt<S: Service>: Server<S> {
+    /// Create the listener socket, notify the liveness socket, and when finally returning, clean the listener socket up after ourselves.
     ///
-    /// In implementations, `SocketWrapper` is generally some kind of higher-level
-    /// abstraction that provides things like RPC connection protocols or some kind of type
-    /// encoding/decoding overlay for the raw connection.
+    /// ## Methods used to create sockets
+    /// This function currently uses [`socket_shims::DefaultUnixSocks`] for managing asynchronous
+    /// connections, and passes around standard library sockets which can be freely converted back
+    /// and forth to async frameworks.
     ///
-    /// This function is where such wrappers are created - though you can of course use an identity
-    /// function and work with raw sockets if you really want to all the way down. This function
-    /// currently is synchronous, but as far as the author of this library knows most async
-    /// runtimes allow easy translation between std sockets and the async sockets, so you can use
-    /// them at-will.
-    #[instrument(skip(unix_listener_wrapping))]
-    pub fn try_and_open_raw_socket(
-        service: ServiceSpec,
+    /// ## Liveness Socket
+    /// This library uses an ephemeral unix socket started by a parent process as a means to
+    /// indicate that a service is live. This can be extracted from the environment created by the
+    /// conventional means of service definition via [`liveness::retrieve_liveness_path`].
+    ///
+    /// The only thing necessary to indicate liveness is simply connecting to the socket (and then
+    /// you can shut down the socket connection).
+    ///
+    /// In this implementation, the liveness socket is ping'd after the creation of a receiving
+    /// socket at the standard path for the service. This is a protocol requirement - if you ping
+    /// the liveness socket with a connection, it means that a socket exists to connect to.
+    #[instrument]
+    async fn start_and_run_server(
+        &self,
+        service: &S,
         context_base_path: &Path,
-        unix_listener_wrapping: impl FnOnce(UnixListener) -> IoResult<SocketWrapper>,
-    ) -> IoResult<Self> {
+        liveness_socket_path: Option<&Path>,
+    ) -> IoResult<Self::FinalOutput> {
         let socket_path: CleanablePathBuf = context_base_path.join(service.socket_name()).into();
-        let raw_listener = UnixListener::bind(&socket_path)?;
-        Ok(Self {
-            service,
-            unix_listener_socket: unix_listener_wrapping(raw_listener)?,
-            socket_path,
-        })
-    }
-
-    /// Runs an arbitrary async service server, consuming the service after performing relevant
-    /// liveness protocols.
-    ///
-    /// Arguments:
-    ///  * the service function runs on the initially provided socket wrapper, and returns some
-    ///  arbitrary result.
-    ///
-    ///  * The liveness path is a component of the mechanism by which this library allows one
-    ///  service to start another. When provided, it is a path to an ephemeral unix socket that the
-    ///  parent service listens on for a single connection. The act of connecting to it indicates
-    ///  that the main service socket is open - which is done during the creation of this structure.
-    ///  This provides several uses:
-    ///     * It means that the moment a connection is received by the parent service or process, it
-    ///     can connect to this service, after starting the current service. This avoids things
-    ///     like polling.
-    ///     * It avoids PID data races in the case that a PID file is being used to indicate
-    ///     liveness - a unique socket address prevents a new process starting after premature
-    ///     termination, with the same PID, creating a PIDfile.
-    ///  Being unable to connect to the liveness path is not an error - the parent process probably
-    ///  unexpectedly died, but the processes involved are generally speaking "persistent on-demand".
-    ///  
-    ///  For information on the canonical way a parent service passes the liveness path to a child
-    ///  service process, see the [`liveness`] module. (in short, it uses an environment variable).
-    ///  
-    ///  * `die_with_parent_prefailure` tells the server function to error out if a liveness path is
-    ///  provided and yet the unix socket can't be connected to - probably something to do with the
-    ///  parent process being dead. This ensures that there is an overlap in the lifetime of the
-    ///  parent process and the lifetime of this service.
-    ///
-    /// Uses [`socket_shims::DefaultUnixSocks`] for creating and managing any temporary sockets
-    /// asynchronously.
-    #[instrument(skip(the_service_function))]
-    pub async fn run_server<T, F: Future<Output = IoResult<T>>>(
-        self,
-        the_service_function: impl FnOnce(SocketWrapper, ServiceSpec) -> F,
-        liveness_path: Option<&Path>,
-        die_with_parent_prefailure: bool,
-    ) -> IoResult<T> {
-        match liveness_path {
-            Some(parent_socket_path) => {
-                match DefaultUnixSocks::us_connect(parent_socket_path).await {
-                    Ok(mut raw_socket) => {
-                        info!("Ping'ed liveness socket @ {} with connection, shutting ephemeral connection.", parent_socket_path.display());
-                        let _ = DefaultUnixSocks::us_shutdown(&mut raw_socket).await;
-                    }
-                    Err(ephemeral_error) => {
-                        if die_with_parent_prefailure {
-                            error!("Could not connect to parent process's ephemeral liveness socket @ {}", parent_socket_path.display());
-                            return Err(ephemeral_error);
-                        } else {
-                            warn!("Couldn't connect to parent process's ephemeral liveness socket @ {} - continuing service anyway, error was: {}", parent_socket_path.display(), ephemeral_error);
-                            drop(ephemeral_error);
-                        }
-                    }
-                }
+        info!(
+            "Obtaining socket on path {}",
+            socket_path.as_ref().display()
+        );
+        let raw_listener_socket = DefaultUnixSocks::ul_bind(socket_path.as_ref()).await?;
+        let _ = match liveness_socket_path {
+            Some(p) => notify_liveness_socket(p).await,
+            None => {
+                info!("No liveness socket path provided, assuming autonomous.");
+                Ok(())
             }
-            None => info!("No liveness path, assuming autonomous"),
         };
-        let Self {
-            service,
-            unix_listener_socket,
-            socket_path,
-        } = self;
 
-        let res = the_service_function(unix_listener_socket, service).await;
+        debug!("Wrapping raw socket in API");
+        let api = self
+            .wrap_listener_socket(service, DefaultUnixSocks::ul_to_std(raw_listener_socket)?)
+            .await?;
+        info!("Starting service @ {}", socket_path.as_ref().display());
+        let res = self.run_server(service, api).await?;
+        info!("Cleaning up socket @ {}", socket_path.as_ref().display());
         drop(socket_path);
-        res
+        Ok(res)
     }
 }
+
+impl<S: Service, T: Server<S>> ServerExt<S> for T {}
 
 #[derive(Debug)]
 /// Holds a particular instance of a [`Service`], along with a base context directory and optional
@@ -512,20 +494,21 @@ impl<'info, S: Service + Sync, ExecutorPrefixComponent: AsRef<OsStr> + Sized + D
             .await
     }
 
-    /// Create a [`ServerService`] - including original socket initialisation - for this service.
-    ///
-    /// See [`liveness`] and function documentation for info on what to pass to the function
-    /// [`ServerService::run_server`]
-    #[instrument(skip(listener_socket_wrapper))]
-    pub fn initialise_server<ServerSocketWrapper>(
-        self,
-        listener_socket_wrapper: impl FnOnce(UnixListener) -> IoResult<ServerSocketWrapper>,
-    ) -> IoResult<ServerService<S, ServerSocketWrapper>> {
-        ServerService::try_and_open_raw_socket(
-            self.bare_service,
-            self.base_context_directory,
-            listener_socket_wrapper,
-        )
+    #[instrument]
+    /// Run an actual server for this service, with a provided implementation and optional [`liveness`]
+    /// socket path.
+    pub async fn serve_service_implementation<ServiceServer: ServerExt<S>>(
+        &self,
+        server: &ServiceServer,
+        liveness_socket_path: Option<&Path>,
+    ) -> IoResult<ServiceServer::FinalOutput> {
+        server
+            .start_and_run_server(
+                &self.bare_service,
+                &self.base_context_directory,
+                liveness_socket_path,
+            )
+            .await
     }
 }
 
@@ -560,7 +543,7 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 ///
 /// Using this macro goes something like the following:
 ///
-/// ```rust
+/// ```rust,compile_fail
 /// use suss::declare_service;
 ///
 /// declare_service! {
@@ -577,7 +560,7 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 ///
 /// The first part of the definition controls what command to run to execute the service, and the
 /// socket it will serve on. The ephemeral liveness socket, as described in
-/// [`ServerService::run_server`], is passed through via an environment variable.
+/// [`ServerExt::start_and_run_server`], is passed through via an environment variable.
 ///
 /// The literal after the @ is the name of the socket within the *base context directory* that
 /// this service hosts itself upon. For example, if your base context directory is `/var/run`, and
@@ -605,7 +588,7 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// [`std::os::unix::net::UnixStream`] and produces (wrapped in a [`std::io::Result`]), a
 /// higher-level abstraction over the stream that the rest of the world will have access to.
 ///
-/// ```rust
+/// ```rust,compile_fail
 ///  ...rest-of-arg... as raw |name_of_raw_std_unix_socket_variable| -> Io<abstracted_and_wrapped_connection_type> {
 ///     Ok(some_wrapped_type)
 ///  }
@@ -683,7 +666,7 @@ macro_rules! declare_service {
 /// is that instead of `pub ServiceTypeName = ` we have `pub service_bundle_function_name() -> ServiceTypeName = `
 ///
 /// This is used like the following:
-/// ```rust
+/// ```rust,compile_fail
 /// use suss::{declare_service_bundle, ServiceBundle};
 ///
 /// declare_service_bundle!{
@@ -765,7 +748,6 @@ macro_rules! declare_service_bundle {
 
 /// Module for usually-necessary imports.
 pub mod prelude {
-    pub use super::ServerService;
     pub use super::{declare_service, declare_service_bundle, ServiceBundle};
 }
 
