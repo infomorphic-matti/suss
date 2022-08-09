@@ -1,6 +1,6 @@
 [package]
 name = "suss"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 authors = ["Matti Bryce <mattibryce@protonmail.com>"]
 license = "AGPL-3.0-or-later"
