@@ -1,8 +1,8 @@
 #![doc = include_str!("README.md")]
 
+pub use blocking;
 /// Re-export of the chaining-transformation convenience functions crate.
 pub use chain_trans;
-pub use blocking;
 
 mod cleanable_path;
 pub mod mapfut;
@@ -69,15 +69,18 @@ use std::{io::Result as IoResult, process::Child, time::Duration};
 use timefut::with_timeout;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Trait used to define a single, startable service, with a relative socket path. For a more
+/// Trait used to define a single service, with a relative socket path. For a more
 /// concise way of implementing services, take a look at the [`declare_service`] and
 /// [`declare_service_bundle`] macros that let you implement this trait far more concisely. For the
 /// items emitted by service bundles, have a look at [`ReifiedService`], which embeds an executor
 /// prefix and base context directory along with an abstract service implementation encoded by this
 /// trait.
 ///
+/// See [`ServiceStartable`] for providing a method to automatically start a service rather than
+/// just connect to it.
+///
 /// A service - in `suss` terminology - is a process that can be communicated with
-/// through a [`std::os::unix::net::UnixStream`].
+/// through a [`UnixSocketInterface::UnixStream`], wrapped in an api.
 ///
 /// Services are run with a *base context path*, which acts as a runtime namespace and
 /// allows multiple instances of collections of services without accidental interaction
@@ -122,9 +125,20 @@ pub trait Service<UnixSockets: UnixSocketInterface>: Debug {
     async fn wrap_connection(
         &self,
         bare_stream: UnixSockets::UnixStream,
-    ) -> IoResult<Self::ServiceClientConnection> where UnixSockets::UnixStream: 'async_trait;
+    ) -> IoResult<Self::ServiceClientConnection>
+    where
+        UnixSockets::UnixStream: 'async_trait;
+}
 
-    /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
+/// An extension trait to [`Service`] that provides a means of starting a service automatically
+/// when it can't be connected to.
+///
+/// See the documentation for [`Service`] for info on base context paths, executor prefixes, etc,
+/// and have a look at [`declare_service`] for an easy way to implement services that call out to
+/// commands when they can't be started.
+#[async_trait(?Send)]
+pub trait ServiceStartable<U: UnixSocketInterface>: Service<U> {
+    /// This should attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service - in [`declare_service!`], this is
     /// done with an environment variable.
     ///
@@ -269,7 +283,8 @@ pub trait ServiceExt<UnixSockets: UnixSocketInterface>: Service<UnixSockets> {
     }
 
     /// Attempt to connect to an already running service. This will not try to start the service on
-    /// failure - for that, see [`Self::connect_to_service`]
+    /// failure - for that, see [`Self::connect_to_service`], which requires the service implements
+    /// [`ServiceStartable`]
     ///
     /// See [`Service`] for information on base context directories.
     #[instrument]
@@ -296,7 +311,9 @@ pub trait ServiceExt<UnixSockets: UnixSocketInterface>: Service<UnixSockets> {
         self.wrap_connection(unix_stream).await
     }
 
-    /// Attempt to connect to the given service in the given runtime context directory.
+    /// Attempt to connect to the given service in the given runtime context directory. This
+    /// requires that the service is startable on failure. If you just want to connect to an
+    /// already running service, see [`Service`].
     ///
     /// See [`Service`] for information on executor commandline prefixes and the base context
     /// directory.
@@ -309,7 +326,10 @@ pub trait ServiceExt<UnixSockets: UnixSocketInterface>: Service<UnixSockets> {
         executor_commandline_prefix: Option<&[impl AsRef<OsStr> + Sized + Debug]>,
         base_context_directory: &Path,
         liveness_timeout: Duration,
-    ) -> IoResult<Self::ServiceClientConnection> {
+    ) -> IoResult<Self::ServiceClientConnection>
+    where
+        Self: ServiceStartable<UnixSockets>,
+    {
         match self
             .connect_to_running_service(base_context_directory)
             .await
@@ -527,10 +547,10 @@ impl<
     /// If you don't care about starting the service on-demand, take a look at
     /// [`Self::connect_to_running`]
     #[instrument]
-    pub async fn connect(
-        &self,
-        liveness_timeout: Duration,
-    ) -> IoResult<S::ServiceClientConnection> {
+    pub async fn connect(&self, liveness_timeout: Duration) -> IoResult<S::ServiceClientConnection>
+    where
+        S: ServiceStartable<U>,
+    {
         self.bare_service
             .connect_to_service(
                 self.executor_prefix,
@@ -585,12 +605,12 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 }
 
 #[macro_export]
-/// A macro that aids in generating the common case of a service that has a command name and calls
-/// out to a command.
+/// A macro that aids in generating the common case of a services with an easy way to add a command
+/// to make it startable by running said command.
 ///
-/// This creates unit-type items that implement the [`Service`] trait, where the services are
-/// started by standard [`std::process::Command`] execution - including correct executor prefix
-/// implementation.
+/// This creates unit-type items that implement the [`Service`] trait, and optionally [`ServiceStartable`],
+/// where the services are started by standard [`std::process::Command`] execution - including correct
+/// executor prefix implementation.
 ///
 /// Wrapping [`std::os::unix::net::UnixStream`]s in higher-level abstractions can be specified in a
 /// number of ways (in future, currently we only implement bare functions). These methods are
@@ -605,16 +625,16 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// declare_service! {
 ///     /// My wonderful service
 ///     pub WonderfulService <unix stream interface type name> = {
-///         "some-wonderful-command" "--and" "--commandline" "args" @ "unix-socket-filename.sock"
+///         /*optional starting method*/ "some-wonderful-command" "--and" "--commandline" "args" /*end opt*/ @ "unix-socket-filename.sock"
 ///         as some_usp_method some_usp_method_specifications
-///     } $(impl { type-parameters-and-constraints-that-go-in-<-and-> }, optional)
+///     } /* optional generic params */ impl { type-parameters-and-constraints-that-go-in-<-and-> }
 /// }
 /// ```
 ///
 /// Services are just unit types in this case, and can have any visibility you like and
 /// documentation or other things like `#[derive]` on them as desired.
 ///
-/// The first part of the definition controls what command to run to execute the service, and the
+/// The first part of the definition if provided controls what command to run to execute the service, and the
 /// socket it will serve on. The ephemeral liveness socket, as described in
 /// [`ServerExt::start_and_run_server`], is passed through via an environment variable.
 ///
@@ -623,17 +643,17 @@ pub trait ServiceBundle<ExecutorPrefixComponent: AsRef<OsStr> + Sized = OsString
 /// the socket name for a service is `hello-service.sock`, then the service should receive
 /// connections on `/var/run/hello-service.sock`.
 ///
-/// Note that there is *no easy way* to pass in the base context directory to the command. This is
-/// a concious decision - this library is designed for *services*, not just *subprocesses*, and
-/// hence other programs should be able to find a service via some method derived from the
-/// environment.
+/// Note that there is *no easy way* to pass in the base context directory to the command if
+/// starting it. This is a concious decision - this library is designed for *services*, not
+/// just *subprocesses*, and hence other programs should be able to find a service via some
+/// method derived from the environment.
 ///
 /// If nothing else, storing a context directory in an environment variable will do
 /// the trick, but the point is that generally the base context directory should be defined by
 /// environment, whether that be `XDG`, or a global fixed directory, or an environment variable, or
 /// any combination of the above or some other environmental context.
 ///
-/// This defines how a service is started and how to locate it. The stuff after the *as* provides
+/// This optionally defines how a service is started and how to locate it. The stuff after the *as* provides
 /// information on what to do once you've got a connection.
 ///
 /// ### Methods
@@ -658,7 +678,7 @@ macro_rules! declare_service {
     {
         $(#[$service_meta:meta])*
         $vis:vis $service_name:ident <$unix_sock_impl:ty> = {
-            $command:literal $($args:literal)* @ $socket_name:literal
+            $($command:literal $($args:literal)*)? @ $socket_name:literal
                 as $unix_stream_preprocess_method:ident $($unix_stream_preprocess_spec:tt)*
         } $(impl {$($typeparam_constraints:tt)*})?
     } => {
@@ -676,12 +696,24 @@ macro_rules! declare_service {
             }
 
             #[inline]
-            async fn wrap_connection(&self, bare_stream: <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream) -> IoResult<Self::ServiceClientConnection> 
+            async fn wrap_connection(&self, bare_stream: <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream) -> IoResult<Self::ServiceClientConnection>
                 where <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream: 'async_trait
             {
                 $crate::declare_service!(@wrap_implementation bare_stream $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*)
             }
 
+        }
+
+        $crate::declare_service!{@maybe_autostart_impl $(with_cli {$command $($args)*})? with_name $service_name <$unix_sock_impl> $(with_constraints {$($typeparam_constraints)*})?}
+
+    };
+    {@maybe_autostart_impl
+        with_cli {$command:literal $($args:literal)*}
+        with_name $service_name:ident <$unix_sock_impl:ty>
+            $(with_constraints {$($typeparam_constraints:tt)*})?
+    } => {
+        #[$crate::async_trait(?Send)]
+        impl $(<$($typeparam_constraints)*>)? $crate::ServiceStartable <$unix_sock_impl> for $service_name {
             fn run_service_command_raw(
                 &self,
                 executor_commandline_prefix: ::core::option::Option<&[impl ::core::convert::AsRef<::std::ffi::OsStr> + ::std::fmt::Debug]>,
@@ -709,6 +741,11 @@ macro_rules! declare_service {
             }
         }
     };
+    // No [`ServiceStartable`] if no cli impl.
+    {@maybe_autostart_impl
+        with_name $service_name:ident <$unix_sock_impl:ty>
+            $(with_constraints {$($typeparam_constraints:tt)*})?
+    } => {};
     // macro "method" for extracting the result type from the preprocess method and specification
     {@socket_connection_type raw |$unix_socket:ident| -> Io<$result:ty> $body:block } => { $result };
     // macro "method" for implementing the connection wrapper stuff
@@ -822,12 +859,8 @@ macro_rules! declare_service_bundle {
 /// Module for usually-necessary imports.
 pub mod prelude {
     pub use super::{
-        declare_service, 
-        declare_service_bundle, 
-        ServiceExt,
-        ServiceBundle, 
+        declare_service, declare_service_bundle, ReifiedService, ServiceBundle, ServiceExt,
         UnixSocketInterface,
-        ReifiedService
     };
     pub use futures_lite::future::block_on as futures_lite_block_on;
 }
@@ -859,6 +892,14 @@ mod tests {
                 .connect(Duration::from_millis(50))
         )
         .is_err());
+
+        // service without a starting command
+        declare_service! {
+            /// Basic test service 2
+            pub TestService2 <U> = {@"test-service-2.sock" as raw |unix_socket| -> Io<U::UnixStream> {
+                Ok(unix_socket)
+            }} impl {U: UnixSocketInterface}
+        }
     }
 
     #[test]
