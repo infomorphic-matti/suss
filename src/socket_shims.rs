@@ -13,7 +13,7 @@ use blocking::{unblock, Unblock};
 /// Note that this is very unideal... In future, I am likely to do a couple things:
 /// * Move the common interface out into a crate
 /// * Make the trait delegate to `poll` functions and add a crapton of Future structs for the
-///   various functions, to avoid the allocations involved in [`async_trait`]. Maybe even see if I
+///   various functions, to avoid the allocations involved in [`macro@async_trait`]. Maybe even see if I
 ///   can't make a macro for that.
 pub trait UnixSocketInterface {
     /// Unix stream type - equivalent to [`std::os::unix::net::UnixStream`]
@@ -167,11 +167,11 @@ impl UnixSocketInterface for TokioUSocks {
     }
 }
 
-/// Uses [`blocking::unblock`] and `blocking::Unblock` to avoid blocking async threads. This is
-/// simple and it will work with a crate like [`pollster`] if you don't care about async stuff -
+/// Uses [`blocking::unblock`] and [`blocking::Unblock`] to avoid blocking async threads. This is
+/// simple and it will work with a crate like `pollster` if you don't care about async stuff -
 /// that should avoid pulling in lots of heavier dependencies. You could also use something like
-/// [`smol`] for a lightweight async runtime if you want a little async, but not the heavyweights
-/// of [`async_std`] or [`tokio`]
+/// `smol` for a lightweight async runtime if you want a little async, but not the heavyweights
+/// of `async_std` or `tokio`
 pub struct StdThreadpoolUSocks;
 
 use std::os::unix::net as std_us;
@@ -183,10 +183,10 @@ impl UnixSocketInterface for StdThreadpoolUSocks {
     type SocketAddr = std_us::SocketAddr;
 
     async fn unix_stream_connect(socket_path: impl AsRef<Path>) -> IoResult<Self::UnixStream> {
-        let pathref_for_thread_sharing = socket_path.as_ref();
-        unblock(|| std_us::UnixStream::connect(pathref_for_thread_sharing))
+        let pathref_for_thread_sharing = socket_path.as_ref().to_owned();
+        unblock(move || std_us::UnixStream::connect(pathref_for_thread_sharing))
             .await
-            .map(|stream| Unblock::new(stream))
+            .map(Unblock::new)
     }
 
     async fn unix_stream_shutdown(s: &mut Self::UnixStream) -> IoResult<()> {
@@ -215,10 +215,10 @@ impl UnixSocketInterface for StdThreadpoolUSocks {
     }
 
     async fn unix_listener_bind(path: impl AsRef<Path>) -> IoResult<Self::UnixListener> {
-        let pathref_for_thread_sharing = path.as_ref();
-        unblock(|| std_us::UnixListener::bind(pathref_for_thread_sharing))
+        let pathref_for_thread_sharing = path.as_ref().to_owned();
+        unblock(move || std_us::UnixListener::bind(pathref_for_thread_sharing))
             .await
-            .map(|listener| Unblock::new(listener))
+            .map(Unblock::new)
     }
 
     async fn unix_listener_accept(

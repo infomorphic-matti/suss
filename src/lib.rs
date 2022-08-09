@@ -122,10 +122,13 @@ pub trait Service<UnixSockets: UnixSocketInterface>: Debug {
     fn socket_name(&self) -> &std::ffi::OsStr;
 
     /// Convert a bare unix stream into a [`Self::ServiceClientConnection`]
+    ///
+    /// Bound on unix stream says that the unix stream lives as long as the produced future,
+    /// essentially.
     async fn wrap_connection(
         &self,
         bare_stream: UnixSockets::UnixStream,
-    ) -> IoResult<Self::ServiceClientConnection>;
+    ) -> IoResult<Self::ServiceClientConnection> where UnixSockets::UnixStream: 'async_trait;
 
     /// This should *synchronously* attempt to start the service, with the given ephemeral liveness
     /// socket path passed through if present to that service - in [`declare_service!`], this is
@@ -362,7 +365,7 @@ pub trait Server<S: Service<U>, U: UnixSocketInterface>: Debug {
     /// Wrap a listening socket into a more structured form - for instance an API wrapper or
     /// something similar.
     ///
-    /// This takes a raw [`UnixListener`]. Async frameworks should let you convert to and from
+    /// This takes a raw [`UnixSocketInterface::UnixListener`]. Async frameworks should let you convert to and from
     /// standard library unix sockets.
     async fn wrap_listener_socket(
         &self,
@@ -679,7 +682,9 @@ macro_rules! declare_service {
             }
 
             #[inline]
-            async fn wrap_connection(&self, bare_stream: <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream) -> IoResult<Self::ServiceClientConnection> {
+            async fn wrap_connection(&self, bare_stream: <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream) -> IoResult<Self::ServiceClientConnection> 
+                where <$unix_sock_impl as $crate::socket_shims::UnixSocketInterface>::UnixStream: 'async_trait
+            {
                 $crate::declare_service!(@wrap_implementation bare_stream $unix_stream_preprocess_method $($unix_stream_preprocess_spec)*)
             }
 
@@ -725,7 +730,9 @@ macro_rules! declare_service {
 ///
 /// The generated structure implements [`ServiceBundle`] as well as providing methods for reifying
 /// the services associated with it. Documentation for the services is attached to the service
-/// type.
+/// type. The structure has an attached unix socket type so it is easy to specify the unix socket
+/// interface for the entire bundle in one go - the functions available on the structure are
+/// exactly those where the service is valid for the socket type.
 ///
 /// For documentation on how service definitions work, see [`declare_service`]. The only difference
 /// is that instead of `pub ServiceTypeName <unix socket interface type> = ` we
@@ -737,7 +744,7 @@ macro_rules! declare_service {
 ///
 /// declare_service_bundle!{
 ///     /// Some wonderful docs
-///     pub WonderfulServices {
+///     pub WonderfulServices <WonderfulUnixSocketImplementationParameter>  {
 ///         /// This is a wonderful service that prints hello
 ///         pub fn wonderful_hello_service() -> WonderfulHelloService<U> = { ... service_definition ... } impl {U: UnixSocketInterface};
 ///         /// This is a wonderful crate-private service that echos back written data
@@ -761,7 +768,7 @@ macro_rules! declare_service {
 macro_rules! declare_service_bundle {
     {
         $(#[$bundle_meta:meta])*
-        $bundle_vis:vis $bundle_name:ident {$(
+        $bundle_vis:vis $bundle_name:ident <$socket_bundle_impl:ident> {$(
             $(#[$service_meta:meta])*
             $service_vis:vis fn $service_fn_name:ident () -> $service_type_name:ident <$unix_sock_impl:ty> = { $($service_definition:tt)*}
                 $(impl { $($unix_sock_constraints:tt)* })?
@@ -769,17 +776,19 @@ macro_rules! declare_service_bundle {
     } => {
 
         $(#[$bundle_meta])*
-        $bundle_vis struct $bundle_name {
+        $bundle_vis struct $bundle_name <$socket_bundle_impl: $crate::socket_shims::UnixSocketInterface>{
             executor_prefix: ::core::option::Option::<::std::vec::Vec::<::std::ffi::OsString>>,
             base_context_path: ::std::path::PathBuf,
+            _socket_iface: ::core::marker::PhantomData<$socket_bundle_impl>
         }
 
-        impl $crate::ServiceBundle for $bundle_name {
+        impl <$socket_bundle_impl: $crate::socket_shims::UnixSocketInterface> $crate::ServiceBundle for $bundle_name<$socket_bundle_impl>{
             fn new(base_context_path: &::std::path::Path) -> Self {
                 use ::std::borrow::ToOwned;
                 Self {
                     base_context_path: base_context_path.to_owned(),
-                    executor_prefix: ::core::option::Option::None
+                    executor_prefix: ::core::option::Option::None,
+                    _socket_iface: ::core::marker::PhantomData
                 }
             }
 
@@ -788,6 +797,7 @@ macro_rules! declare_service_bundle {
                 Self {
                     base_context_path: base_context_path.to_owned(),
                     executor_prefix: ::core::option::Option::Some(executor_prefix.to_owned()),
+                    _socket_iface: ::core::marker::PhantomData
                 }
             }
         }
@@ -802,8 +812,10 @@ macro_rules! declare_service_bundle {
         )*
 
         // Now create the reification functions on our service bundle :)
-        impl $bundle_name {$(
-            $service_vis fn $service_fn_name $(<$($unix_sock_constraints)*>)? (&self) -> $crate::ReifiedService<'_, $service_type_name, $unix_sock_impl> {
+        impl <$socket_bundle_impl: $crate::socket_shims::UnixSocketInterface> $bundle_name<$socket_bundle_impl> {$(
+            $service_vis fn $service_fn_name(&self) -> $crate::ReifiedService<'_, $service_type_name, $socket_bundle_impl>
+                where $service_type_name: $crate::Service::<$socket_bundle_impl>
+            {
                 match &self.executor_prefix {
                     Some(ep) => $crate::ReifiedService::reify_service_with_executor($service_type_name, &self.base_context_path, ep.as_slice()),
                     None => $crate::ReifiedService::reify_service($service_type_name, &self.base_context_path)
@@ -841,8 +853,7 @@ mod tests {
         }
 
         assert!(block_on(
-            TestService
-                .reify(&tmpdir)
+            ServiceExt::<StdThreadpoolUSocks>::reify(TestService, &tmpdir)
                 .connect(Duration::from_millis(50))
         )
         .is_err());
@@ -851,7 +862,7 @@ mod tests {
     #[test]
     pub fn service_bundle_macro_test() {
         declare_service_bundle! {
-            pub TestBundle {
+            pub TestBundle <B> {
                 /// some service
                 pub fn echo_service() -> EchoService <StdThreadpoolUSocks> = {
                     "echo-executable-wekdasjkfgnjsd" "--and" "--some" "--args" @ "echo-service.sock" as raw |unix_socket| ->
@@ -864,7 +875,7 @@ mod tests {
         }
 
         let tmpdir = temp_dir();
-        let wonderful_bundle = TestBundle::new(&tmpdir);
+        let wonderful_bundle = TestBundle::<StdThreadpoolUSocks>::new(&tmpdir);
         assert!(block_on(
             wonderful_bundle
                 .echo_service()
