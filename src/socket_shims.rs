@@ -47,7 +47,7 @@ pub trait UnixSocketInterface {
     async fn unix_stream_read(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<usize>;
 
     /// Read a [`u8`] slice from the unix stream, repeating until it reads everything.
-    async fn unix_stream_read_all(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()>;
+    async fn unix_stream_read_exact(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()>;
 
     /// Bind as a unix listening socket at the path
     async fn unix_listener_bind(path: impl AsRef<Path>) -> IoResult<Self::UnixListener>;
@@ -96,7 +96,7 @@ impl UnixSocketInterface for AsyncStdUSocks {
         s.read(buf).await
     }
 
-    async fn unix_stream_read_all(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
+    async fn unix_stream_read_exact(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
         use async_std::io::ReadExt;
         s.read_exact(buf).await
     }
@@ -149,7 +149,7 @@ impl UnixSocketInterface for TokioUSocks {
         s.read(buf).await
     }
 
-    async fn unix_stream_read_all(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
+    async fn unix_stream_read_exact(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
         use tokio::io::AsyncReadExt;
         // For some reason tokio read_exact returns a usize even though it just fills the buffer.
         // We discard it.
@@ -209,7 +209,7 @@ impl UnixSocketInterface for StdThreadpoolUSocks {
         s.read(buf).await
     }
 
-    async fn unix_stream_read_all(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
+    async fn unix_stream_read_exact(s: &mut Self::UnixStream, buf: &mut [u8]) -> IoResult<()> {
         use futures_lite::AsyncReadExt;
         s.read_exact(buf).await
     }

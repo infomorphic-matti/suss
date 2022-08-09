@@ -1,14 +1,8 @@
-//! This is a library designed to ease the creation of a collection of singleton services namespaced to a single
-//! base directory path with an arbitrary network of dependencies, starting services as needed,
-//! using unix sockets as the communication mechanism.
-//!
-//! In the case that a service already exists, then this will communicate with the appropriate
-//! socket, rather than start a new one.
-//!
-//! To get started, take a look at the [`declare_service`] macro.
+#![doc = include_str!("README.md")]
 
 /// Re-export of the chaining-transformation convenience functions crate.
 pub use chain_trans;
+pub use blocking;
 
 mod cleanable_path;
 pub mod mapfut;
@@ -827,7 +821,15 @@ macro_rules! declare_service_bundle {
 
 /// Module for usually-necessary imports.
 pub mod prelude {
-    pub use super::{declare_service, declare_service_bundle, ServiceBundle};
+    pub use super::{
+        declare_service, 
+        declare_service_bundle, 
+        ServiceExt,
+        ServiceBundle, 
+        UnixSocketInterface,
+        ReifiedService
+    };
+    pub use futures_lite::future::block_on as futures_lite_block_on;
 }
 
 #[cfg(test)]
