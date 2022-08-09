@@ -160,12 +160,15 @@ pub trait ServiceStartable<U: UnixSocketInterface>: Service<U> {
     /// before it has been connected to. In here you can add it to a threadpool or something if you want to
     /// .wait on it. Bear in mind it is an async function so don't block.
     ///
-    /// The default version of this function will simply drop the child and leave it a zombie -
+    /// The default version of this function will simply drop the child and leave it an orphan -
     /// this is desired if you want the services to be more persistent, but if you want to tie the
     /// lifetime of the service to the lifetime of the parent process, spawning a task that just
     /// .wait()s on the child or does some async equivalent may be sufficient. Well, it might also
     /// block your own process until the child dies but hey ho!, sort that out yourself :) - you
     /// probably want to use your runtime's equivalent of `spawn` for this.
+    ///
+    /// (by default: [see here for
+    /// info](https://unix.stackexchange.com/questions/149319/new-parent-process-when-the-parent-process-dies))
     ///
     /// Of course this function, like the [`Self::run_service_command_raw`] function, are not used at all
     /// if the service already exists in base context directory.
